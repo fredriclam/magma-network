@@ -2,11 +2,10 @@ import numpy as np
 import scipy
 import scipy.sparse
 import scipy.sparse.linalg
-import scipy.spatial
 import matplotlib
 import matplotlib.cm
 import matplotlib.pyplot as plt
-import networkx as nx
+
 g = 10
 
 class Node():
@@ -18,9 +17,9 @@ def p_lithostatic(z, p_surf=1e5, z_surf=0, rho_crust=2.8e3, g=10):
   ''' Lithostatic pressure as function of depth z. '''
   return p_surf - rho_crust * g * (z - z_surf)
 
-def T_geothermal(z, T_surf=273.15, z_surf=0, grad=-10/1e3):
+def T_geothermal(z, T_surf=273.15, z_surf=0, grad=-25/1e3):
   ''' Crust geothermal temperature as function of depth z.
-  Default gradient is (10 K / km). '''
+  Default gradient is (25K/km). '''
   return T_surf + grad * (z - z_surf)
 
 def zero_aligned_cmap(clim):
@@ -42,91 +41,13 @@ def zero_aligned_cmap(clim):
       f'trunc(bwr,{cinterval[0]},{cinterval[1]})',
       matplotlib.cm.bwr(np.linspace(cinterval[0], cinterval[1], 1000)))
 
-def smoother(x, scale):
-  ''' Returns one-sided compact smoothed step, such that
-    1. u(x < -scale) = 0
-    2. u(x >= 0) = 1.
-    3. u smoothly interpolates from 0 to 1 in between.
-  '''
-  # Shift, scale, and clip to [-1, 0] to prevent exp overflow
-  if scale != 0:
-    _x = np.clip(x / scale + 1, 0, 1)
-  else:
-    _x = np.where(x >= 0, 1, 0)
-  f0 = np.exp(-1/np.where(_x == 0, 1, _x))
-  f1 = np.exp(-1/np.where(_x == 1, 1, 1-_x))
-  # Return piecewise evaluation
-  return np.where(_x >= 1, 1,
-         np.where(_x <= 0, 0, 
-         f0 / (f0 + f1)))
-
-def op_D(h, Nr):
-    ''' Central first-derivative operator '''
-    upper = 0.5/h*np.ones(Nr-1)
-    upper[0] *= 2.0
-    lower = -0.5/h*np.ones(Nr-1)
-    lower[-1] *= 2.0
-    diag = np.zeros(Nr)
-    diag[0] = -1.0/h
-    diag[-1] = 1.0/h
-    D = scipy.sparse.diags([upper, diag, lower], [1, 0, -1])
-    return D
-
-def op_D2( h, Nr):
-    ''' Central second-derivative operator. Nothing is done at the boundary. '''
-    # Define left-biased derivative operator for u
-    DL = scipy.sparse.lil_matrix(
-        scipy.sparse.diags([1.0/h*np.ones(Nr), -1.0/h*np.ones(Nr-1)], [0, -1]))
-    DL[0,:] = DL[1,:]
-    # Define right-biased derivative operator for stress
-    DR = scipy.sparse.lil_matrix(
-        scipy.sparse.diags([-1.0/h*np.ones(Nr), 1.0/h*np.ones(Nr-1)], [0, 1]))
-    DR[-1,:] = DR[-2,:]
-    return DL @ DR
-
-def op_E_drr(h, Nr, r_mesh):
-  ''' Linear mapping from radial displacement to spherically symmetric deviatoric rr-strain'''
-  # Diagonal matrix containing values of 1/r
-  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
-  E_drr = (2.0/3.0) * (op_D(h, Nr) - diag_inv_r)
-  return E_drr
-
-def op_E_kk(h, Nr, r_mesh):
-  ''' Linear mapping from radial displacement to spherically symmetric kk-strain'''
-  # Diagonal matrix containing values of 1/r
-  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
-  E_kk = op_D(h, Nr) + 2.0*diag_inv_r
-  return E_kk
-
-def op_A(h, Nr, r_mesh):
-  ''' Elasticity differential operator valid in the interior nodes:
-        d^2/dr^2 + 2/r * d/dr - 2/r^2
-    '''
-  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
-  A = (op_D2(h, Nr)
-        + 2.0 * diag_inv_r @ op_D(h, Nr)
-        - 2.0 * diag_inv_r * diag_inv_r)
-  return A
-
-def prop_factory(t_b=1e11, t_d=5e10, K_crust=10e9, G_crust=10e9,
-                 K_f=10e9, rho0=2500, mu0=1e6, r_hydr=5):
-  return dict(
-    t_b = t_b,     # Set Maxwell times
-    t_d = t_d,     # Set Maxwell times
-    K_crust = K_crust,
-    G_crust = G_crust,
-    K_f = K_f,
-    rho0 = rho0,
-    mu0 = mu0,      # Constant viscosity assumption
-    r_hydr = r_hydr,     # Effective hydraulic radius
-  )
 
 class MagmaChamber(Node):
   def __init__(self,
                x:float=np.nan, y:float=0.0, z:float=np.nan,
                p_setting:object=None, T_setting:object=None,
                V_setting:object=None,
-               c_v=1e3, K=10e9, v0=1/2.5e3, p0=25e6, g=10):
+               c_v=1e3, K=1e9, v0=1/2.5e3, p0=25e6, g=10):
     ''' Initializes a magma chamber from coordinates, pressure, temperature,
     and volume.
 
@@ -315,6 +236,500 @@ class MagmaChamber(Node):
     }
     return "\n".join([k + v for k, v in output_dict.items()])
 
+class GlobalSystem():
+  ''' Global coupled system of chambers with methods for manipulating the network.
+  Assumes a fixed admittance matrix Y. Uses unoptimized numerical scheme.
+
+  This is an approximation to the continuum percolation formulation, where the
+  percolation condition is strictly based on a distance cutoff.
+  '''
+
+  # Define schema for data shape
+  @property
+  def data_slice(self):
+    ''' Schema for organizing data within vector for a block.
+    Defines a dict that maps keys to non-overlapping, contiguous slices. First
+    slice must start at index 0. '''
+    Nr = self.Nr
+    schema = dict(
+        gamma_drr=slice(0, Nr),
+        gamma_kk=slice(Nr, 2*Nr),
+        mass=slice(2*Nr, 2*Nr+1),
+        energy=slice(2*Nr+1, 2*Nr+2),
+        massCO2=slice(2*Nr+2, 2*Nr+3),
+        massH2O=slice(2*Nr+3, 2*Nr+4),
+    )
+    # Return schema
+    return schema
+
+  def data_slice_global(self, i, qty_name):
+    ''' Map (chamber_idx, qty_name) to data slice in global vector '''
+    try:
+      local_slice=self.data_slice[qty_name]
+    except KeyError as e:
+      raise ValueError(f"Quantity name '{qty_name}' was not found in schema;"
+                       + f" here is a list of valid quantity names: "
+                       + str(self.data_slice.keys())) from e
+    return slice(i*self.block_size+local_slice.start,
+                 i*self.block_size+local_slice.stop)
+
+  @property
+  def block_size(self):
+    ''' Size of a single block, corresponding to one chamber. '''
+    return max([s.stop for s in self.data_slice.values()])
+
+  def check_schema_validity(self) -> None:
+    ''' Check validity of schema (basic checks only). Checks that the
+    implementation of GlobalSystem.data_slice is a valid mapping to slices of a
+    vector of size `block_size`. '''
+    schema = self.data_slice
+    _validation = dict()
+    for k, v in schema.items():
+      _validation[v.start] = _validation.get(v.start, 0) + 1
+      _validation[v.stop]  = _validation.get(v.stop, 0) + 1
+    _range_endpoints = list(schema.keys())
+    _occur_count = list(schema.values())
+    _occur_count_sorted = [count for _, count
+                           in sorted(zip(_range_endpoints, _occur_count))]
+    if (sorted(_range_endpoints)[0] == 0 # Range starts 0
+        and _occur_count_sorted[-1] == 1 # Last index is unique
+        and _occur_count_sorted[0] == 1  # First index is unique
+        and all([val == 2 for val in _occur_count_sorted[1:-1]])): # Data is contiguous
+      return
+    else:
+      return _range_endpoints, _occur_count
+      raise ValueError("Data schema seems invalid. The location of data in the "
+                      + "state vector for a single chamber may be invalid.")
+
+  def __init__(self, Y:np.array, t_b, t_d, K_crust, G_crust,
+               rho0=2500, R0=100, p0=10e6, K_f=10e9, Nr=50, remote_sigma_xx=0.0):
+    # Save parameters TODO: generalize to chamber-by-chamber input
+    self.Y = Y
+
+    self.R0 = R0
+    self.rho0 = rho0
+    self.p0 = p0
+    self.K_f = K_f
+    self.t_b = t_b
+    self.t_d = t_d
+    self.K_crust = K_crust
+    self.G_crust = G_crust
+    self.M_crust = K_crust + 4.0*G_crust/3.0
+
+    self.Nr = Nr
+    self.num_blocks = Y.shape[0]
+    self.num_dof = self.num_blocks * self.block_size
+
+    # Check implemented data schema
+    self.check_schema_validity()
+
+    # Compute reference mass
+    self.m0 = rho0 * 4.0 / 3.0 * np.pi * R0 ** 3
+    # Compute mesh info
+    self.num_inf = 20*R0
+    self.num_min = R0
+    self.h = (self.num_inf - self.num_min) / (self.Nr-1)
+
+    ''' Numerical differential operators '''
+    # Define vector values 1/r
+    self.r_mesh = np.linspace(self.num_min, self.num_inf, self.Nr)
+    # Define diagonal matrix of values 1/r
+    self.inv_r = scipy.sparse.diags([1.0/self.r_mesh], [0])
+
+    # Initialize matrix H, vector k
+    self.H = None
+    self.k = None
+
+  def op_D(self, h, Nr):
+    ''' Central first-derivative operator '''
+    upper = 0.5/h*np.ones(Nr-1)
+    upper[0] *= 2.0
+    lower = -0.5/h*np.ones(Nr-1)
+    lower[-1] *= 2.0
+    diag = np.zeros(Nr)
+    diag[0] = -1.0/h
+    diag[-1] = 1.0/h
+    D = scipy.sparse.diags([upper, diag, lower], [1, 0, -1])
+    return D
+
+  def op_D2(self, h, Nr):
+    ''' Central second-derivative operator. Nothing is done at the boundary. '''
+    # Define left-biased derivative operator for u
+    DL = scipy.sparse.lil_matrix(
+        scipy.sparse.diags([1.0/h*np.ones(Nr), -1.0/h*np.ones(Nr-1)], [0, -1]))
+    DL[0,:] = DL[1,:]
+    # Define right-biased derivative operator for stress
+    DR = scipy.sparse.lil_matrix(
+        scipy.sparse.diags([-1.0/h*np.ones(Nr), 1.0/h*np.ones(Nr-1)], [0, 1]))
+    DR[-1,:] = DR[-2,:]
+    return DL @ DR
+
+  def op_E_drr(self, h, Nr, r_mesh):
+    ''' Linear mapping from radial displacement to spherically symmetric deviatoric rr-strain'''
+    # Diagonal matrix containing values of 1/r
+    diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+    E_drr = (2.0/3.0) * (self.op_D(h, Nr) - diag_inv_r)
+    return E_drr
+
+  def op_E_kk(self, h, Nr, r_mesh):
+    ''' Linear mapping from radial displacement to spherically symmetric kk-strain'''
+    # Diagonal matrix containing values of 1/r
+    diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+    E_kk = self.op_D(h, Nr) + 2.0*diag_inv_r
+    return E_kk
+
+  def op_A(self, h, Nr, r_mesh):
+    ''' Elasticity differential operator valid in the interior nodes:
+          d^2/dr^2 + 2/r * d/dr - 2/r^2
+     '''
+    diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+    A = (self.op_D2(h, Nr)
+         + 2.0 * diag_inv_r @ self.op_D(h, Nr)
+         - 2.0 * diag_inv_r * diag_inv_r)
+    return A
+
+  def local_construct_affine_u_map(self) -> tuple:
+    ''' Construct matrix and vector representing the mapping from time-dependent
+    variables to radial displacement u, i.e., for a time-dependent vector q,
+      u = Hq + k.
+    Returns tuple (H, k). Inverts sparsely, but returns a possibly dense matrix H.
+    '''
+
+    # Add variables to scope
+    Nr, h, block_size, r_mesh, R0, p0, m0, M_crust, K_crust, G_crust = (self.Nr, self.h,
+      self.block_size, self.r_mesh, self.R0, self.p0, self.m0, self.M_crust, self.K_crust, self.G_crust)
+
+    # Construct differential operators explicitly
+    A = self.op_A(h, Nr, r_mesh)
+    D = self.op_D(h, Nr)
+    diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+
+    ''' Compute mapping L_u from viscous strains to displacements '''
+    # Assemble rectangular system for static equilibrium
+    L_u = scipy.sparse.lil_matrix((Nr, Nr + block_size))
+    # Construct elastic portion of static equilibrium equation
+    L_u[:, 0:Nr] = A
+    # Construct mapping of γ_drr to term in static equilibrium equation
+    L_u[:, Nr:2*Nr] = 2 * (G_crust/M_crust) * D + 6 * (G_crust/M_crust) * diag_inv_r
+    # Construct mapping of γ_kk to term in static equilibrium equation
+    L_u[:, 2*Nr:3*Nr] = (K_crust/M_crust) * D
+
+    ''' Set traction boundary condition at r = R0
+      \sigma_{rr} = -(p - p_0)
+    where \sigma_{rr} is the normal stress (in excess of "crustal prestress")
+    and p_0 is the pressure linearization point
+    '''
+    # Replace first row with boundary traction (normalized by M_crust) Dirichlet lift operator at r = R0 (linearized boundary treatment)
+    L_u[0, :] = 0.0
+    L_u[0, 0] += -1.0 / h
+    L_u[0, 1] += 1.0 / h
+    L_u[0, 0] += (2*K_crust - 4*G_crust/3) / M_crust/ R0
+    # Add r = R boundary dependence on γ_drr
+    L_u[0, Nr] = -2 * G_crust / M_crust
+    # Add r = R boundary dependence on γ_kk
+    L_u[0, 2*Nr] = -K_crust / M_crust
+    # Add r = R boundary dependence on boundary pressure, linearly dependent on u, m
+    L_u[0, 0] += - 3 * K_f / M_crust / R0
+    L_u[0, 3*Nr] += K_f / m0 / M_crust
+    # Add RHS loading due to traction boundary condition
+    f_u = np.zeros((Nr, 1))
+    f_u[0] += K_f / M_crust
+    # Save RHS as sparse vector
+    f_u = scipy.sparse.csc_matrix(f_u)
+
+    ''' Set boundary condition at r = r_inf '''
+    # Replace last row with boundary displacement Dirichlet lift operator
+    L_u[Nr-1, :] = 0
+    L_u[Nr-1, Nr-1] = 1
+    # Finalize matrix format
+    L_u = L_u.tocsc()
+
+    ''' Define mapping from time-dependent variables to u '''
+    # Compute affine map q -> Hq + k from time-dependent variables (viscous strains, mass, energy...) to u
+    H = scipy.sparse.linalg.spsolve(L_u[0:Nr, 0:Nr], -L_u[0:Nr, Nr:])
+    k = scipy.sparse.linalg.spsolve(L_u[0:Nr, 0:Nr], f_u)[:,np.newaxis]
+
+    return H, k
+
+  @property
+  def Hk(self):
+    ''' Wrapper for caching H, k matrices mapping time-dependent states q to u
+    via
+      u = H @ q + k.
+    See also local_construct_affine_u_map '''
+    if self.H is None or self.k is None:
+      self.H, self.k = self.local_construct_affine_u_map()
+    return self.H, self.k
+
+  def local_construct_Lf(self) -> tuple:
+    ''' Assemble local matrix for a single chamber
+      This is L + G @ H in
+        dq/dt + (L + G @ H) @ q == - G @ k,
+      accounting for the effect of static displacement.
+
+      Returns tuple (L, f, H, k) with respective sizes
+        (block_size, block_size,)
+      and
+        (block_size, 1,)
+      and
+        (block_size, block_size,)
+      and
+        (block_size, 1,)
+      respectively. Here H, k are passed through to reduce redundant computation.
+    '''
+
+    # Add variables to scope
+    Nr, block_size, h, r_mesh = self.Nr, self.block_size, self.h, self.r_mesh
+    t_d, t_b = self.t_d, self.t_b
+
+    # Get affine map from state vector q to instantaneous displacement u
+    H_block, k_block = self.local_construct_affine_u_map()
+
+    # Assemble dependence of viscous strain evolution on displacement u (through elastic strain)
+    G = scipy.sparse.lil_matrix((block_size, Nr))
+    G[0:Nr, 0:Nr] = -1.0 / t_d * self.op_E_drr(h, Nr, r_mesh)
+    G[Nr:2*Nr, 0:Nr] = -1.0 / t_b * self.op_E_kk(h, Nr, r_mesh)
+    # Compute matrix L
+    L_block = scipy.sparse.lil_matrix((block_size, block_size))
+    L_block[np.arange(0,Nr), np.arange(0,Nr)] = (1 / t_d)
+    L_block[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / t_b)
+    # Add dependence on u through Schur complement term
+    L_block += G @ H_block
+
+    ''' Assemble local RHS vector for a single chamber
+      This is f - G @ K,
+    where f contains any external source terms for the time-dependent variables.
+    '''
+    # Assemble right hand side for local problem
+    f_block = scipy.sparse.lil_matrix((block_size, 1))
+    # Put dependence on spherical boundary condition
+    f_block -= G @ k_block
+
+    return L_block, f_block, H_block, k_block
+
+  def assemble_global_Lf(self):
+    ''' Assemble global matrix, coupling all chambers '''
+    Nr, num_blocks, block_size = self.Nr, self.num_blocks, self.block_size
+
+    L = scipy.sparse.lil_matrix((num_blocks * block_size, num_blocks * block_size))
+    f = scipy.sparse.lil_matrix((num_blocks * block_size, 1))
+    # Construct block representing independent viscoelastic evolution // TODO: have each depend on its own parameters
+    L_block, f_block, H_block, k_block = self.local_construct_Lf()
+    for i in range(num_blocks):
+      L[i*block_size:(i+1)*block_size, i*block_size:(i+1)*block_size] = L_block
+      f[i*block_size:(i+1)*block_size,0] = f_block
+
+    ''' Add mass transfer terms
+
+    Pressure differences between chambers are
+    p_i - p_j = -(K_fi - K_fj) - (3 K_fi u_ri / R_i - 3 K_fj u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
+    and mass rate ~ rho_upstream * hyd_cond * (p_i - p_j).
+
+    Here we estimate
+    p_i - p_j = - 3 * K_f (u_ri / R_i - u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
+    and thus
+    \dot{m}_{ij} = Adj_{ij} * hydr_cond * rho0 * K_f * (
+      - 3 * (u_ri / R_i - u_rj / R_j) + (m_i/m_0i - m_j/m_0j)
+    )
+    where Adj is the adjacency matrix. Here the hydraulic conductivity has units of
+    mass flux per pressure; that is, (m^3/s)/Pa in SI units.
+
+    '''
+
+    # Save the closed-system linear dynamics matrix
+    self.L_closed_system = L.copy()
+
+    for i in range(self.Y.shape[0]):
+      for j in range(i+1, self.Y.shape[1]):
+        # Compute mass rate coefficient (kg / s)
+        _coeff = self.Y[i,j] * self.rho0 * self.K_f
+        # Compute dependence of mass rate on ith viscoelastic field as u(r=R) / R0 through H_i
+        L[i*block_size + 2*Nr, i*block_size:(i+1)*block_size] -= 3.0 * _coeff * H_block[0,:] / self.R0 # R0i
+        L[j*block_size + 2*Nr, i*block_size:(i+1)*block_size] += 3.0 * _coeff * H_block[0,:] / self.R0 # R0i
+        # Compute dependence of mass rate on jth viscoelastic field as u(r=R) / R0 through H_j
+        L[i*block_size + 2*Nr, j*block_size:(j+1)*block_size] += 3.0 * _coeff * H_block[0,:] / self.R0 # H_j, R0j
+        L[j*block_size + 2*Nr, j*block_size:(j+1)*block_size] -= 3.0 * _coeff * H_block[0,:] / self.R0 # H_j, R0j
+        # Compute dependence of mass rate on ith chamber mass
+        L[i*block_size + 2*Nr, i*block_size + 2*Nr] += _coeff / self.m0 # m0i -- note this diagonal term should be +
+        L[j*block_size + 2*Nr, i*block_size + 2*Nr] -= _coeff / self.m0 # m0i
+        # Compute dependence of mass rate on jth chamber mass
+        L[i*block_size + 2*Nr, j*block_size + 2*Nr] -= _coeff / self.m0 # m0j
+        L[j*block_size + 2*Nr, j*block_size + 2*Nr] += _coeff / self.m0 # m0j
+
+    return L, f
+
+  def pressure(self, q):
+    ''' Compute vector of pressures, indexed by chamber number '''
+    H_block, k_block = self.Hk
+    p = np.zeros((self.num_blocks, 1))
+    for i in range(self.num_blocks):
+      # Compute boundary displacement
+      u_R0 = (H_block @ q[i*self.block_size:(i+1)*self.block_size] + k_block)[0]
+      dp_u = -3 * self.K_f * u_R0 / self.R0
+      # Mass added pressure increase
+      dp_m = self.K_f * (q[self.data_slice_global(i,"mass")] - self.m0) / self.m0
+      p[i] = self.p0 + dp_u + dp_m
+    return p
+
+  def u(self, q):
+    ''' Compute vector of displacements, indexed by chamber number '''
+    H_block, k_block = self.Hk
+    u = np.zeros((self.num_blocks, self.Nr))
+    for i in range(self.num_blocks):
+      u[i,:] = (H_block @ q[i*self.block_size:(i+1)*self.block_size] + k_block).squeeze()
+    return u
+
+  def sigma_rr(self, q):
+    # Extract q blockwise, for each chamber
+    H_block, k_block = self.Hk
+    sigma_rr = np.zeros((self.num_blocks, self.Nr))
+
+    for i in range(self.num_blocks):
+      q_loc = q[i*self.block_size:(i+1)*self.block_size].squeeze()
+      # Compute boundary displacement
+      u_loc = (H_block @ q_loc + k_block.squeeze())
+      # Radial component of strain
+      radial = (self.op_D(self.h, self.Nr) @ u_loc)
+      # Angular components (phi + theta) of stress div. by M_crust
+      angular = u_loc / self.r_mesh
+      # Elastic strain
+      eps_drr = (2.0/3.0) * (radial - angular)
+      eps_kk = radial + 2.0 * angular
+      # Viscous strain γ_drr
+      gamma_drr = q_loc[0:self.Nr]
+      # Viscous strain γ_drr
+      gamma_kk = q_loc[self.Nr:2*self.Nr]
+      # Compute stress from elastic strain
+      sigma_drr = 2 * self.G_crust * (eps_drr - gamma_drr)
+      sigma_kk = 3 * self.K_crust * (eps_kk - gamma_kk)
+      sigma_rr[i,:] = sigma_drr + (1.0/3.0) * sigma_kk
+    return sigma_rr
+
+  @staticmethod
+  def compute_eigen_system(L) -> dict:
+    ''' Post-process system '''
+
+    # Compute eigensystem of L
+    eig_result = np.linalg.eig((L).todense())
+    # Filter out imaginary noise
+    try:
+      L_eigval = eig_result.eigenvalues # np.real_if_close(eig_result.eigenvalues)
+      L_eigvec = eig_result.eigenvectors # np.real_if_close(eig_result.eigenvectors)
+    except AttributeError: # Backward compatible eig syntax
+      L_eigval = eig_result[0]
+      L_eigvec = eig_result[1]
+
+    # Compute 1/eig where nonzero
+    Linv_eigval = np.full(L_eigval.shape, np.inf, dtype=np.complex128)
+    np.divide(1.0, L_eigval, out=Linv_eigval, where=L_eigval!=0)
+
+    # Sort finite 1/eig
+    sort_index = np.argsort(L_eigval.real)[::-1]
+    Linv_eigval_sorted = Linv_eigval[sort_index]
+    Linv_eigval_finite = Linv_eigval_sorted[np.where(Linv_eigval_sorted != 0)]
+    eigs = dict(
+        eigval=L_eigval[sort_index],
+        eigvec=L_eigvec[sort_index],
+        Linv_eigval=Linv_eigval_sorted,
+        Linv_eigval_finite =Linv_eigval_finite,
+    )
+
+    return eigs
+
+  @staticmethod
+  def matshow(L):
+    ''' Wrapper for matshow '''
+    return plt.matshow(np.log10(np.abs(L).todense()), cmap=plt.cm.Blues)
+
+  @staticmethod
+  def eigshow(eig):
+    ''' Eigenvalue plot on complex plane '''
+    plt.subplot(1,2,1)
+    plt.plot(1/t_d, 0, '^r')
+    plt.plot(1/t_b, 0, '*r')
+    plt.scatter(eig["eigval"].real, eig["eigval"].imag, c='k')
+    plt.xlabel("Re$(\lambda)$, 1/s")
+    plt.ylabel("Im$(\lambda)$, 1/s")
+    plt.gca().set_xscale("log")
+    plt.grid("on")
+    plt.title("Eigenvalues of $L$ in system $\dot{\mathbf{q}} + L\mathbf{q} = \mathbf{f}$")
+
+    plt.subplot(1,2,2)
+    plt.scatter(-eig["eigval"].real, -eig["eigval"].imag, c='k')
+    plt.xlabel("Re$(-\lambda)$, 1/s")
+    plt.ylabel("Im$(-\lambda)$, 1/s")
+    plt.gca().set_xscale("log")
+    plt.grid("on")
+    plt.title("Negative eigenvalues if any")
+    plt.tight_layout()
+
+
+def smoother(x, scale):
+  ''' Returns one-sided compact smoothed step, such that
+    1. u(x < -scale) = 0
+    2. u(x >= 0) = 1.
+    3. u smoothly interpolates from 0 to 1 in between.
+  '''
+  # Shift, scale, and clip to [-1, 0] to prevent exp overflow
+  if scale != 0:
+    _x = np.clip(x / scale + 1, 0, 1)
+  else:
+    _x = np.where(x >= 0, 1, 0)
+  f0 = np.exp(-1/np.where(_x == 0, 1, _x))
+  f1 = np.exp(-1/np.where(_x == 1, 1, 1-_x))
+  # Return piecewise evaluation
+  return np.where(_x >= 1, 1,
+         np.where(_x <= 0, 0, 
+         f0 / (f0 + f1)))
+
+def op_D(h, Nr):
+    ''' Central first-derivative operator '''
+    upper = 0.5/h*np.ones(Nr-1)
+    upper[0] *= 2.0
+    lower = -0.5/h*np.ones(Nr-1)
+    lower[-1] *= 2.0
+    diag = np.zeros(Nr)
+    diag[0] = -1.0/h
+    diag[-1] = 1.0/h
+    D = scipy.sparse.diags([upper, diag, lower], [1, 0, -1])
+    return D
+
+def op_D2( h, Nr):
+    ''' Central second-derivative operator. Nothing is done at the boundary. '''
+    # Define left-biased derivative operator for u
+    DL = scipy.sparse.lil_matrix(
+        scipy.sparse.diags([1.0/h*np.ones(Nr), -1.0/h*np.ones(Nr-1)], [0, -1]))
+    DL[0,:] = DL[1,:]
+    # Define right-biased derivative operator for stress
+    DR = scipy.sparse.lil_matrix(
+        scipy.sparse.diags([-1.0/h*np.ones(Nr), 1.0/h*np.ones(Nr-1)], [0, 1]))
+    DR[-1,:] = DR[-2,:]
+    return DL @ DR
+
+def op_E_drr(h, Nr, r_mesh):
+  ''' Linear mapping from radial displacement to spherically symmetric deviatoric rr-strain'''
+  # Diagonal matrix containing values of 1/r
+  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+  E_drr = (2.0/3.0) * (op_D(h, Nr) - diag_inv_r)
+  return E_drr
+
+def op_E_kk(h, Nr, r_mesh):
+  ''' Linear mapping from radial displacement to spherically symmetric kk-strain'''
+  # Diagonal matrix containing values of 1/r
+  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+  E_kk = op_D(h, Nr) + 2.0*diag_inv_r
+  return E_kk
+
+def op_A(h, Nr, r_mesh):
+  ''' Elasticity differential operator valid in the interior nodes:
+        d^2/dr^2 + 2/r * d/dr - 2/r^2
+    '''
+  diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
+  A = (op_D2(h, Nr)
+        + 2.0 * diag_inv_r @ op_D(h, Nr)
+        - 2.0 * diag_inv_r * diag_inv_r)
+  return A
+
 class GlobalSystemThreshold():
   ''' Global coupled system of chambers with methods for manipulating the network.
 
@@ -462,13 +877,6 @@ class GlobalSystemThreshold():
     
     self.remote_sigma_xx = remote_sigma_xx
 
-    # Compute pairwise distances
-    coords = np.array([[node.x, node.y, node.z] for node in self.nodes])
-    self.dists = scipy.spatial.distance.cdist(coords, coords)
-    # Check pairwise distances
-    if np.any((self.dists == 0) & (1 - np.eye(self.num_blocks)).astype(bool)):
-      illegal_nodes = scipy.sparse.coo((self.dists == 0) & (1 - np.eye(self.num_blocks)))
-      raise ValueError(f"Distance between nodes was zero for (i,j) = : ({illegal_nodes.row}, {illegal_nodes.col})")
 
   def _init_node(self, node) -> None:
     ''' Initializes node by allocating the linear elasticity affine mapping
@@ -597,7 +1005,7 @@ class GlobalSystemThreshold():
     # node.L_u = L_u
 
   def get_connectivity(self, q):
-    ''' Signed connectivity matrix with units of admittance ( (m/s) / Pa ) '''
+    ''' Signed connectivity matrix with units of admittance '''
     # Get system size information
     Nr, num_blocks, block_size = self.Nr, self.num_blocks, self.block_size
     # Compute pressures
@@ -611,9 +1019,13 @@ class GlobalSystemThreshold():
         if i == j:
           continue
         node_j = self.nodes[j]
-        dist = self.dists[i,j]
-        # Check distance threshold
-        if dist > self.max_edge_dist:
+        # Compute distance
+        dist = np.sqrt((node_i.x - node_j.x) ** 2
+                       + (node_i.y - node_j.y) ** 2
+                       + (node_i.z - node_j.z) ** 2)
+        if np.isclose(dist, 0.0):
+          raise ValueError("Distance between chamber {i} and {j} is zero.")
+        elif dist > self.max_edge_dist:
           continue
         # Compute average pressure gradient
         dpdx = (p_node[i] - p_node[j]) / dist
@@ -711,30 +1123,27 @@ class GlobalSystemThreshold():
       return L, M, f
 
   def mass_rates(self, q):
-    ''' Compute the strictly lower triangular outgoing mass transfer matrix M,
-    where M[i,j] represents the mass rate from j to i through edge (i,j),
-    where the mass rate is nonnegative.
-    
-    Properties:
-      * Entries of M are >= 0
-      * Column sums of M give the rate of mass leaving node j
-      * Row sums of M give the rate of mass entering node i
-      * M - M.T is the full antisymmetric mass transfer matrix, such that
-          (M - M.T).sum(axis=1) is the vector (dm/dt) for each row i. '''
     # Get system size information
     num_blocks, block_size = self.num_blocks, self.block_size
+
     # Compute pressures
     p_node = self.pressure(q)
     # Allocate mass rates from j to i
     mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
-    
     for i in range(num_blocks):
+      node_i = self.nodes[i]
       M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
       for j in range(i+1, num_blocks):
-        if self.dists[i,j] > self.max_edge_dist:
+        node_j = self.nodes[j]
+
+        # Compute distance
+        dist = float(np.sqrt((node_i.x - node_j.x) ** 2
+                      + (node_i.y - node_j.y) ** 2
+                      + (node_i.z - node_j.z) ** 2))
+        if dist > self.max_edge_dist:
           continue
-        # Compute average pressure gradient between self.nodes[i] and self.nodes[j]
-        dpdx = (p_node[i] - p_node[j]) / self.dists[i,j]
+        # Compute average pressure gradient
+        dpdx = (p_node[i] - p_node[j]) / dist
         # Factor between (0, 1) that modulates flow between the two chambers
         threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
                                     self.dpdx_threshold_scale))
@@ -742,13 +1151,10 @@ class GlobalSystemThreshold():
           raise ValueError
         if threshold_factor > 1e-15:
           # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
-          Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / self.dists[i,j]
+          Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
           # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
           M += (Y * self.rho0 * self.K_f) * self.M_stencils[(i,j,)]
       mass_rates[:,i] = -(M @ q)[self.mass_indices].squeeze()
-    
-    # Remove diagonal
-    mass_rates[np.arange(0, num_blocks), np.arange(0, num_blocks)] = 0
 
     return mass_rates
 
@@ -911,60 +1317,11 @@ class GlobalSystemThreshold():
       displacements[i,...] = np.array(self.u(q_t))
     return masses, pressures, sigma_rr, displacements
 
-  def create_single_mass_injection_source(self, mdot_inj):
-    def f(t, q):
-      f_inj = np.zeros((self.num_dof))
-      f_inj[self.data_slice_global(0, "mass")] = mdot_inj
-      return f_inj
-    return f
-  
-  def create_single_mass_injection_custom(self, fn):
-    ''' Wrapper for custom function of mass rate mdot(t, q). '''
-    def f(t, q):
-      f_inj = np.zeros((self.num_dof))
-      f_inj[self.data_slice_global(0, "mass")] = fn(t, q)
-      return f_inj
-    return f
-
-  def create_row_mass_injection_source(self, mdot_inj, nodes_per_layer:list):
-    def f(t, q):
-      f_inj = np.zeros((self.num_dof))
-      # Count nodes in the bottom layer for an N-way split
-      N_split = nodes_per_layer[0]
-      for i in range(N_split):
-        f_inj[self.data_slice_global(i, "mass")] = mdot_inj / N_split
-      return f_inj
-    return f
-
-  def create_single_pressure_injection_source(self, feed_overpressure):
-    def f(t, q):
-      f_inj = np.zeros((self.num_dof))
-      p_node = self.pressure(q)
-      # Compute overpressure for node 0
-      deltap = feed_overpressure - (p_node[0] - self.nodes[0].p0)
-      # Compute injection rate by flow rule
-      injection_rate = self.rho0 * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
-      f_inj[self.data_slice_global(0, "mass")] = injection_rate
-      return f_inj
-    return f
-
-  def create_eruption_source(self, p_erupt = 5e6, mu_erupt= 1e5, r_conduit = 25): # Eruption parameters # TODO: melt mu(T(z))?
-    def f(t, q):
-      ''' Compute eruption rate at index -1 '''
-      p_node = self.pressure(q)
-      f_erupt = np.zeros((self.num_dof))
-      # Compute pressure in excess of critical eruption overpressure
-      deltap = (p_node[-1] - self.nodes[-1].p0) - p_erupt
-      if deltap > 0:
-        eruption_rate = self.rho0 * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
-        # Set eruption rate in mass conservation equation
-        f_erupt[self.data_slice_global(-1, "mass")] = -eruption_rate
-      return f_erupt
-    return f
-
-  def simulation(self, q0, t_vec, f_inject:callable, f_erupt:callable, method_order=1):
+  def simulation(self, t_vec, q0, method_order=1):
     ''' Timestepping using a partially implicit scheme. Opening of network edges
     are done explicitly, with a "limiter" for eruption. '''
+
+    
 
     # Start q with initial condition
     q = q0.copy()
@@ -974,17 +1331,31 @@ class GlobalSystemThreshold():
     dt = np.nan
     dt_last = np.nan
     dt_last_last = np.nan
-    # Max order possible at each timestep
+    # Max order possible
     max_order = np.ones(t_vec.size, dtype=int)
 
     self._step_strategy = np.zeros(t_vec.size, dtype=float)
     L, M, f = self.assemble_global_LMf(q)
-    f = f.toarray()
     # lu_out = scipy.sparse.linalg.splu(scipy.sparse.eye(global_sys.num_dof) + 0.5 * dt * L)
 
     m_erupted = 0.0
     m_erupted_out = np.zeros((t_vec.size,))
-    
+
+    ''' Set eruption parameters '''
+    # Eruption parameters
+    r_conduit = 25
+    mu_erupt = 1e5
+    # Overpressure required for eruption
+    p_erupt = 5e6
+    # Set total mass rate for injection
+    mdot_inj = 3.0
+    # Add source term for injection
+    f_inj = 0.0 * f
+    # Count nodes in the bottom layer for an N-way split
+    N_split = nodes_per_layer[0]
+    for i in range(N_split):
+      f_inj[self.data_slice_global(i, "mass")] = mdot_inj / N_split
+
     for i, t in enumerate(t_vec):
       if i > 0:
         # Compute timestep
@@ -994,25 +1365,24 @@ class GlobalSystemThreshold():
 
         # Strang split      
         # q = scipy.sparse.linalg.spsolve(scipy.sparse.eye(global_sys.num_dof) + dt * L, q + f * dt)
+
+        p_node = self.pressure(q)
         
-        # Evaluate eruption rate
-        vec_f_erupt = f_erupt(t, q)
-        # Eruption rate limiter for first-order explicit Euler # TODO: use pressure limiter instead
-        max_eruption_rate = np.abs(float(q[self.data_slice_global(-1, "mass")] - self.nodes[-1].m0) / dt)
-        vec_f_erupt = np.clip(vec_f_erupt, -max_eruption_rate, max_eruption_rate)
-        # Integrate erupted mass
-        m_erupted += -float(vec_f_erupt[self.data_slice_global(-1, "mass")]) * dt
-        # Vector shape cleanup
-        f_tot = np.reshape(
-          f.ravel() + f_inject(t, q).ravel() + vec_f_erupt.ravel(),
-          (self.num_dof, 1))
+        deltap = (p_node[-1] - self.nodes[-1].p0) - p_erupt
+        f_erupt = 0.0 * f_inj
+        if deltap > 0:
+          eruption_rate = self.rho0 * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+          # Eruption rate limiter for first-order Euler
+          max_eruption_rate = (q[self.data_slice_global(-1, "mass")] - self.nodes[-1].m0) / dt
+          if eruption_rate > max_eruption_rate:
+            eruption_rate = max_eruption_rate
+          # Set eruption rate in mass conservation equation
+          f_erupt[self.data_slice_global(-1, "mass")] = -eruption_rate
+          # Integrate erupted mass
+          m_erupted += eruption_rate * dt
 
         # Quasi-implicit one-step solve (strictly M(q^n) is used instead of M(q^n+1))
-        q = scipy.sparse.linalg.spsolve(
-          scipy.sparse.eye(self.num_dof) + dt * (L + M),
-          q + dt * f_tot)
-        # Expand shape of q
-        q = np.reshape(q, (self.num_dof, 1))
+        q = scipy.sparse.linalg.spsolve(scipy.sparse.eye(self.num_dof) + dt * (L + M), q + dt * (f + f_inj + f_erupt))[:,np.newaxis]
 
         if False:
           # (1/3) BDF1, update matrix inv(I + dt*L)
@@ -1051,267 +1421,218 @@ class GlobalSystemThreshold():
       q_out[i,...] = q
       m_erupted_out[i] = m_erupted
 
-    return q_out, m_erupted_out
+      return q_out, m_erupted_out
 
-  def sample_mass_rate_z(self, q_out, z_samples):
-    ''' Return vertical mass rate as an array, where
-      m_dot[i,j] = (t[i], z[j]),
-    t is the vector of times specified for the simulation, and
-    z spans z_min, z_max with a number of nodes equal to `z_samples`. '''
+def solve_network_N(N_row, total_vol, mass_inj, t_vec=None, N_t:int=100, method:int=1,
+                    t_b=1e11, t_d=5e10, K_crust=10e9, G_crust=10e9, K_f=5e9, rho0=2500):
+  ''' Solve network problem for an N-by-N grid.
   
-    # Compute sampling mesh
-    z = np.array([node.z for node in self.nodes])
-    z_scale = z.max() - z.min()
-    z_sample_mesh = np.linspace(0, z_scale, z_samples)
-    # Allocate
-    mdot_grid = np.zeros((q_out.shape[0], z_sample_mesh.size))
+  N_row:     Number of rows in grid
+  total_vol: Total volume
+  mass_inj:  Total mass injected in chamber -1
+  method:    Order of BDF method to use [1|2]
+  t_vec:     If None, uses N_t to compute a fixed t_vec. Else, uses t_vec directly
+  '''
 
-    for time_idx in range(q_out.shape[0]):
-      # Extract global state vector
-      q = q_out[time_idx,:]
-      # Compute strictly lower triangular mass transfer matrix
-      M = self.mass_rates(q).tocoo()
+  if method > 2:
+    method = 2
+    print("Warning: method of order > 2 is not implemented. Using BDF2. ")
 
-      # For each positive mass rate along edge
-      for i, j, mdot in zip(M.row, M.col, M.data):
-        # Generate mask 
-        z_i, z_j = self.nodes[i].z, self.nodes[j].z
-        z_min = 0.5 * (z_i + z_j) - 0.5 * np.abs(z_j - z_i)
-        z_max = 0.5 * (z_i + z_j) + 0.5 * np.abs(z_j - z_i)
-        # Add mdot resolved onto z-axis for z-samples within z-bounds of edge 
-        mdot_grid[time_idx,:] += np.where((z_sample_mesh >= z_min) & (z_sample_mesh < z_max),
-                 np.sign(z_i - z_j) * mdot, 0.0)
+  # Ingest material properties
+  mat_props = dict(
+    t_b = t_b,
+    t_d = t_d,
+    K_crust = K_crust,
+    G_crust = G_crust,
+    K_f = K_f,
+    rho0 = rho0,
+  )
 
-    return z_sample_mesh, mdot_grid
+  # Create grid of chambers by coordinates x, z (fixing y = 0)
+  N_col = N_row
 
-  def make_composite_plot(self, t_vec, q_out, m_out,
-                          z_samples=400,
-                          include_m_out=True, node_scale= 10):
-    ''' Generates useful plots and returns (fig, ax). '''
+  x_axis = np.linspace(0,2e3,N_col)
+  z_axis = np.linspace(0,-2e3,N_row)
 
-    # Set axis plotting scales (with manual axis labeling)
-    t_plot_scale = 1e9
-    m_plot_scale = 1e9
+  # Compute 1-D arrays of x-coordinates and z-coordinates
+  N_nodes = x_axis.size * z_axis.size
+  mg_x, mg_z = np.meshgrid(x_axis, z_axis)
+  x_nodes = mg_x.flatten()
+  z_nodes = mg_z.flatten()
 
-    # Plot specifications
-    fig = plt.figure(figsize=(11,8), dpi=100)
-    gridspec = fig.add_gridspec(4, 3, width_ratios=[1, 5, 1],
-        height_ratios=[1, 2, 1, 2])
-    ax = [fig.add_subplot(gridspec[0,1]),
-          fig.add_subplot(gridspec[1,1]),
-          fig.add_subplot(gridspec[2,1]),
-          fig.add_subplot(gridspec[3,0]),
-          fig.add_subplot(gridspec[3,1]),
-          fig.add_subplot(gridspec[3,2]),]
-    cmap = matplotlib.cm.hsv
-    # Assign color to each node in cmap
-    colors = cmap(np.linspace(0, 1, self.num_blocks,endpoint=False))
+  # Create list of MagmaChamber objects with corresponding coordinates
+  list_nodes = [MagmaChamber(x=x, y=0.0, z=z,
+                    p_setting=None,
+                    T_setting=None,
+                    V_setting=0.1)
+              for (x,z) in zip(x_nodes, z_nodes)]
 
-    ''' Create stacked area plot '''
-    # Compute mass, pressure, stresses, displacement of each chamber
-    m, p, sigmas, u = self.post_process(t_vec, q_out)
-    # Create mass color bar plot
-    if include_m_out:
-      # Augment data with erupted mass time series
-      m_bars_data = np.concatenate((m.T, m_out[np.newaxis,:]), axis=0)
-      colors_aug = np.concatenate((colors, [[0,0,0,1]]), axis=0)
-    else:
-      m_bars_data = m.T
-      colors_aug = colors
-    polys = ax[1].stackplot(t_vec/t_plot_scale,
-                            (m_bars_data - m_bars_data.min(axis=1, keepdims=True))/m_plot_scale,
-                            colors=colors_aug)
-    ax[1].set_ylabel("$\Delta m$ ($10^9$ kg)", fontsize=12)
-    ax[1].set_xlim(t_vec[0]/1e9, t_vec[-1]/1e9)
+  # Create weighted adjacency matrix by starting with dense graph + pruning
+  # Symmetric distance matrix
+  d = np.sqrt((x_nodes - x_nodes[:,np.newaxis]) ** 2 + (z_nodes - z_nodes[:,np.newaxis]) ** 2)
+  # Constant viscosity assumption
+  mu0 = 1e5
+  # Effective hydraulic radius
+  r_hydr = 1
 
-    ''' Create extrusive ratio plot '''
-    # Compute time series of total mass in
-    m_total = np.concatenate((m.T, m_out[np.newaxis,:]), axis=0).sum(axis=0)
-    m_in_total = m_total - m_total[0]
-    # Compute extrusive / total
-    extrusive_ratio = np.zeros_like(m_in_total)
-    np.divide(m_out, m_in_total, where=m_in_total!=0, out=extrusive_ratio)
-    ax[0].plot(t_vec/t_plot_scale, extrusive_ratio, 'r')
-    ax[0].set_ylabel(r"$\dot{m}_{out} / \dot{m}_{in}$", fontsize=12)
-    ax[0].set_xlim(t_vec[0]/1e9, t_vec[-1]/1e9)
-    ax[0].set_ylim(0, 1)
+  # Allocate flow admittance matrix
+  Y = np.zeros_like(d)
+  # Minimum distance; filter out zeros unless zero is the only entry
+  dist_list = np.sort(np.array(np.ravel(d)))
+  dist_list = dist_list[dist_list > 0]
+  if len(dist_list) == 0:
+    dist_list = np.array([0])
 
-    ''' Create total mass erupted time series '''
-    ax[2].plot(t_vec/t_plot_scale, m_out/m_plot_scale, 'k')
-    ax[2].set_ylabel("Erupted ($10^9$ kg)", fontsize=12)
-    ax[2].set_xlim(t_vec[0]/1e9, t_vec[-1]/1e9)
+  # Adjacency filter: only nodes satisfying this condition are connected
+  adj_filter:np.array = (d <= dist_list.min() * (1 + 1e-7))
+  # Compute 1/dist into Y
+  np.divide(1.0, d, where=(d != 0)&adj_filter, out=Y)
+  # Compute flow admittance matrix ( (m/s) / Pa )
+  Y *= r_hydr * r_hydr / 16 / mu0
 
-    ''' Create mdot(z) color plot '''
-    # Sample mass rates at fixed z_sample
-    z_sample, mdot_grid = self.sample_mass_rate_z(q_out, z_samples)
-    # Create color map with range of mdot_grid
-    clim = (mdot_grid.min(), mdot_grid.max(),)
-    shift_div_cmap = zero_aligned_cmap(clim)
-    if np.all(mdot_grid == 0):
-      print("Data values are all zero. Skipping mass rate spatial plot.")
-    else:
-      plt.sca(ax[4])
-      mg_t, mg_z = np.meshgrid(t_vec, z_sample)
-      plt.contourf(mg_t/1e9, mg_z/1e3, mdot_grid.T, cmap=shift_div_cmap, levels=np.linspace(clim[0], clim[1], 100))
-      cb = plt.colorbar(ax=ax[5], location='left')#, ax=ax[:])
-      ax[5].set_visible(False)
-      cb.set_label("Upward mass rate (kg/s)", fontsize=12)
-      plt.xlabel("Time ($10^9$ s)", fontsize=12)
-      plt.ylabel("Depth (km)", fontsize=12)
+  R0 = ((total_vol/N_nodes) / (4*np.pi/3))**(1.0/3.0)
 
-    fig.tight_layout()
+  global_sys = GlobalSystem(Y, t_b, t_d, K_crust, G_crust,
+                    rho0=rho0, R0=R0, p0=10e6, K_f=10e9, Nr=100)
+  # Assemble L, f system
+  L, f = global_sys.assemble_global_Lf()
+  # Get slice for accessing mass from chamber [0]
+  global_sys.data_slice_global(0, "mass")
 
-    # Plot graph, with no border
-    self.show_network(q_out[0,:], ax=ax[3], node_scale=node_scale, add_ax_labels=False, font_size=0, clip_on=False)
-    [spine.set_visible(False) for spine in ax[3].spines.values()]
+  # Set initial condition
+  q0 = np.zeros((global_sys.num_dof, 1))
+  # Set absolute mass
+  for i in range(global_sys.num_blocks):
+    q0[global_sys.data_slice_global(i, "mass")] = global_sys.m0
+  # Add mass increment in chamber N-1
+  q0[global_sys.data_slice_global(global_sys.num_blocks - 1, "mass")] += mass_inj
 
-    ax[3].set_ylim(0, (z_sample[-1] - z_sample[0])/1e3)
+  if t_vec is None:
+    t1 = 1e9
+    t2 = 0.5e12
+    # Define vector of t points for both timescales
+    t_vec = np.array([*np.linspace(0, t1, N_t+1), *np.linspace(t1, t2, N_t+1)[1:]])
+  # Start q with initial condition
+  q = q0.copy()
+  # Allocate output vectors
+  q_out = np.zeros((t_vec.size, *q.shape))
+  # Save last dt for cache check
+  dt = np.nan
+  dt_last = np.nan
+  dt_last_last = np.nan
+  # Max order possible
+  max_order = np.ones(t_vec.size, dtype=int)
+  
+  global_sys._step_strategy = np.zeros(t_vec.size, dtype=float)
 
-    fig.set_tight_layout(True)
+  for i, t in enumerate(t_vec):
+    if i > 0:
+      # Compute timestep
+      dt = t_vec[i] - t_vec[i-1]
+        
+      # q = scipy.sparse.linalg.spsolve(scipy.sparse.eye(global_sys.num_dof) + dt * L, q + f * dt)
 
-    return fig, ax
-
-  def residence_time_sim(self, t_vec, q_out, N_particles=10000,
-                         create_plot=True, add_legend=True):
-    ''' Computes residence time statistics as a post-process.
-    A set of particles are placed at node 0, and with Poisson probability
-    proportional to mass rate divided by current node mass, the particles walk
-    randomly on the graph.
-
-    Returns (node_location, node_z), where
-      node_location is the history of node indices for a particle ensemble,
-        with size (t_vec.size, N_particles)
-      node_z is the history of z-position for a particle ensemble, with
-        size (t_vec.size, N_particles)
-    If create_plot is True, a plot is created showing the mean and quartile
-    depths of the particle ensemble. Flag add_legend specifies whether to
-    include length in the plot.
-
-    Note: dqdt = (f + f_inj + f_erupt) - (L + M) @ q, and we can extract
-    dmdt from the appropriate indices. At the same time, for
-      F_diag = scipy.sparse.diags(
-        (f + f_inj + f_erupt)[self.mass_indices].toarray().squeeze())
-    At the same time,
-      dmdt = (self.mass_rates(q) + F_diag).todense().sum(axis=1).T
-    '''
-
-    # Initialize set of particles at node 0
-    curr_node = np.full((N_particles,), 0, dtype=int)
-    # Allocate node location history for each particle
-    node_location = np.full((t_vec.size, N_particles), -1, dtype=int) 
-    # Fill initial
-    node_location[0,:] = 0
-
-    for i, t in enumerate(t_vec[1:]):
-      # Load q, pressure from ODE solution
-      q = q_out[i,...]
-
-      p_node = self.pressure(q) # TODO: pressure history
-
-      # Compute turnover rates (mdot / m)
-      turnover_rates = scipy.sparse.diags(1/q[self.mass_indices].squeeze()) @ self.mass_rates(q)
-      # Compute instantaneous Poisson rates from total out rate from node j
-      poisson_lambda = np.array(turnover_rates.sum(axis=0)).squeeze()
-      # Probability of escaping from node j to node i given that particle escapes
-      path_probability = np.full(turnover_rates.shape, 1 / self.num_blocks)
-      np.divide(turnover_rates.toarray(), poisson_lambda, where=poisson_lambda!=0, out=path_probability)
-      # Probability of exiting in current timestep
-      prob = poisson_lambda[curr_node] * (t_vec[i] - t_vec[i-1])
-
-      # End walk at last node
-      prob[-1] = 0
-
-      # Determine whether each particle exits node
-      exit_roll = np.random.rand(N_particles) < prob
-      # Choose exit path based on probability
-      new_node = (np.random.rand(N_particles)[np.newaxis,:]
-                  < np.cumsum(path_probability[:,curr_node], axis=0)).argmax(axis=0)
-      # Move all particles
-      curr_node = np.where(exit_roll, new_node, curr_node)
-      # Save particle location
-      node_location[i+1,:] = curr_node
-
-    if create_plot:
-      t_plot_scale = 1e9
-      z_plot_scale = 1e3
-      # Convert residence node to depth
-      node_z = np.array([node.z for node in self.nodes])[node_location]
-      # Ensemble statistics at current timestep
-      loc_quants = np.quantile(node_z, [0.25, 0.5, 0.75], axis=1)
-      loc_mean = node_z.mean(axis=1)
-      loc_std = node_z.std(axis=1)
-      plt.plot(t_vec/t_plot_scale, loc_quants[1,:]/z_plot_scale, 'k-', label="median")
-      plt.plot(t_vec/t_plot_scale, loc_mean/z_plot_scale, 'k--', label="mean")
-      # Shade between 1- and 3-quartiles
-      plt.fill_between(t_vec/t_plot_scale,
-                       loc_quants[0,:]/z_plot_scale,
-                       loc_quants[2,:]/z_plot_scale, color=[0.1, 0, 1.0, 0.5])
-      plt.xlabel("Time ($10^9$ s)", fontsize=12)
-      plt.ylabel("Depth (km)", fontsize=12)
-      # plt.title("Tracer location quartiles")
-      if add_legend:
-        plt.legend()
-
-    return node_location, node_z
-
-  def compute_effective_connectivity(self, t_vec, q_out, window_nodes_vec=None):
-    ''' Compute effective connectivity at several averaging timescales
-    Returns list of tuples [(n, dt_window, t_window_center, effective_conductivity)]
-    If windows_nodes_vec is not provided, selects some windows of size ~4^n.
-    '''
-
-    if window_nodes_vec is None:
-      # Select window nodes with size ~4^n
-      window_nodes_vec = 2**np.arange(1, int(np.log2(t_vec.size)), 2) - 1
-
-    # Compute Y(t)
-    Y_list = [None for _ in range(q_out.shape[0])]
-    for i in range(q_out.shape[0]):
-      # Get instantaneous, asymmetric connectivity matrix of graph
-      Y_native = self.get_connectivity(q_out[i,:])
-      # Symmetrized connectivity
-      Y_list[i] = scipy.sparse.csr_matrix(np.maximum(Y_native, Y_native.T))
-
-    all_effective_conductivities = []
-    for n in window_nodes_vec:
-      # From t_vec compute array of window-center times
-      if n == 1:
-        t_avg_range = t_vec
+      if method == 2 and np.isclose(dt, dt_last) and not np.isclose(dt_last_last, dt_last):
+        # BDF2, update matrix
+        lu_out = scipy.sparse.linalg.splu(scipy.sparse.eye(global_sys.num_dof) + (2.0/3.0) * dt * L)
+        q = lu_out.solve((4.0/3.0) * q + (2.0/3.0) * f * dt - (1.0/3.0) * q_out[i-2,...])
+        global_sys._step_strategy[i] = 2.0
+      elif method == 2 and np.isclose(dt, dt_last) and np.isclose(dt_last_last, dt_last):
+        # BDF2, use cached matrix
+        q = lu_out.solve((4.0/3.0) * q + (2.0/3.0) * f * dt - (1.0/3.0) * q_out[i-2,...])
+        global_sys._step_strategy[i] = 2.5
+      elif not np.isclose(dt, dt_last):
+        # BDF1, update matrix inv(I + dt*L)
+        lu_out = scipy.sparse.linalg.splu(scipy.sparse.eye(global_sys.num_dof) + dt * L)
+        q = lu_out.solve(q + f * dt)
+        global_sys._step_strategy[i] = 1.0
       else:
-        t_avg_range = 0.5 * (t_vec[:-n+1] + t_vec[n-1:]) 
-      # Compute window size
-      dt_window = n * (t_vec[1] - t_vec[0])
+        # BDF1, use cached matrix inv(I + dt*L)
+        q = lu_out.solve(q + f * dt)
+        global_sys._step_strategy[i] = 1.5
 
-      # Allocate output for current window size
-      effective_cond = np.zeros_like(t_avg_range, dtype=float)
+    dt_last_last = dt_last
+    dt_last = dt
+    q = np.reshape(q, (q.size, 1))
+    # Save result
+    q_out[i,...] = q
 
-      for i in range(t_vec.size - n + 1):
-        # Time-averaged connectivity
-        Y_avg = np.sum(np.abs(Y_list[i:i+n])) / n
-        if Y_avg.nnz == 0:
-          # No edges, zero connectivity 
-          continue
-        # Check node 0 is connected to node -1
-        G = nx.Graph(Y_avg)
-        if not nx.has_path(G, 0, self.num_blocks-1):
-          continue
-        # Construct s-t test vector
-        chi = np.zeros(Y_avg.shape[0],)
-        chi[[0, -1]] = [1.0, -1.0]
-        # Compute effective conductivity using conjugate gradient for PSD matrix
-        v, exit_code = scipy.sparse.linalg.cg(nx.laplacian_matrix(G), chi)
-        if exit_code != 0:
-          raise ValueError(f"scipy.sparse.linalg.cg terminated with unsuccessful exit code {exit_code}.")
-        st_resistance = np.dot(chi, v)
-        # Save effective conductivity at time t to output vector
-        effective_cond[i] = 1.0 / st_resistance
+  # Tack on used material properties
+  # TODO: integrate material properties into data object
+  global_sys.mat_props = mat_props
 
-      all_effective_conductivities.append((n, dt_window, t_avg_range, effective_cond))
+  return t_vec, q_out, global_sys
 
-    return all_effective_conductivities
 
 
 if __name__ == "__main__":
+
+  ''' Generate single magma chamber with (x,y,z),(p_litho, T_geotherm, V=100) '''
+  R0_example = 100
+  mc1 = MagmaChamber(x=100.0, y=0.0, z=-1000.0,
+                    p_setting=10e6,
+                    T_setting=None,
+                    V_setting=4/3*np.pi*R0_example**3)
+  print("Example magma chamber:")
+  print(mc1)
+
+
+  # Set Maxwell times
+  t_b = 1e11
+  t_d = 5e10
+  K_crust = 10e9
+  G_crust = 10e9
+  K_f = 5e9
+  rho0 = 2500
+
+  # Fix total volume
+  total_vol = (4/3)*np.pi*1000.0**3
+  # Fix mass injection
+  mass_inj = total_vol * rho0 * 0.001
+
+  N_range = np.arange(1,7)
+  t_outs = [None for _ in N_range]
+  q_outs = [None for _ in N_range]
+  gs_outs = [None for _ in N_range]
+
+  # Define vector of t points spanning both timescales
+  N_t = 100
+  t1 = 1e7
+  t2 = 1e8
+  t_vec = np.array([*np.linspace(0, t1, N_t+1), *np.linspace(t1, t2, N_t+1)[1:]])
+
+  for i, N in enumerate(N_range):
+    t_outs[i], q_outs[i], gs_outs[i] = solve_network_N(N, total_vol, mass_inj, t_vec=t_vec, method=2,
+                                                      t_b=1e6, t_d=1e6, K_crust=10e9, G_crust=10e9, K_f=5e9, rho0=2500)
+    print(f"Solved network N = {N}.")
+
+    ''' Post-process time-dependent simulation '''
+  def post(t_vec, q_out, global_sys):
+    masses = np.zeros((t_vec.size, global_sys.num_blocks, ))
+    pressures = np.zeros((t_vec.size, global_sys.num_blocks, ))
+    stresses = np.zeros((t_vec.size, global_sys.num_blocks, global_sys.Nr,))
+    displacements = np.zeros((t_vec.size, global_sys.num_blocks, global_sys.Nr,))
+
+    for i in range(q_out.shape[0]):
+      # State vector q at time t
+      q_t = q_out[i,...]
+      masses[i,...] = np.array([q_t[global_sys.data_slice_global(i, "mass")]
+                          for i in range(global_sys.Y.shape[0])]).squeeze()
+      pressures[i,...] = np.array(global_sys.pressure(q_t)).squeeze()
+      stresses[i,...] = np.array(global_sys.sigma_rr(q_t))
+      displacements[i,...] = np.array(global_sys.u(q_t))
+    return masses, pressures, stresses, displacements
+
+  outputs = [post(*tup) for tup in zip (t_outs, q_outs, gs_outs)]
+  m_outs, p_outs, sigma_rr_outs, u_outs = zip(*outputs)
+
+  fig, ax = plt.subplots(1,len(outputs),figsize=(15,4.2))
+
+  for i in range(len(outputs)):
+    polys = ax[i].stackplot(t_outs[i][:len(t_outs[i])//2],
+                          m_outs[i][:len(t_outs[i])//2].T - gs_outs[i].m0)
+  fig.tight_layout()
+  print("Excess mass distribution over shorter transfer timescale")
 
   for i in range(len(p_outs)):
     plt.loglog(t_outs[i], p_outs[i][:,-1] / 1e6, '.-', label=f"${N_range[i]} \\times {N_range[i]}$")
