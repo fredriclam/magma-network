@@ -1,3 +1,6 @@
 __pycache__/
 export/
 prototype_assets/
+*.png
+*.pkl
+*.npz
