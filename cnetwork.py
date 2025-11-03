@@ -18,6 +18,10 @@ def p_lithostatic(z, p_surf=1e5, z_surf=0, rho_crust=2.8e3, g=10):
   ''' Lithostatic pressure as function of depth z. '''
   return p_surf - rho_crust * g * (z - z_surf)
 
+def p_hydrostatic(z, p_surf=1e5, z_surf=0, rho_magma=2.5e3, g=10):
+  ''' Hydrostatic pressure as function of depth z. '''
+  return p_surf - rho_magma * g * (z - z_surf)
+
 def T_geothermal(z, T_surf=273.15, z_surf=0, grad=-10/1e3):
   ''' Crust geothermal temperature as function of depth z.
   Default gradient is (10 K / km). '''
@@ -315,6 +319,7 @@ class MagmaChamber(Node):
     }
     return "\n".join([k + v for k, v in output_dict.items()])
 
+
 class GlobalSystemThreshold():
   ''' Global coupled system of chambers with methods for manipulating the network.
 
@@ -401,6 +406,7 @@ class GlobalSystemThreshold():
     self.max_edge_dist = max_edge_dist
     self.num_blocks = len(nodes)
     self.num_dof = self.num_blocks * self.block_size
+    self.remote_sigma_xx = remote_sigma_xx
     # Check implemented data schema for organizing field variables
     self.check_schema_validity()
     # Initialize nodes with linearization point, operators
@@ -469,15 +475,11 @@ class GlobalSystemThreshold():
           raise ValueError(f"Distance between chamber {i} and {j} is " \
                            f"close to zero ({dist:.2e}).")
     
-
-      
     # Array of indices corresponding to dm_i/dt
     self.mass_indices = np.concatenate([
       np.arange(0, self.num_dof)[self.data_slice_global(i, "mass")]
       for i in range(self.num_blocks)])
     
-    self.remote_sigma_xx = remote_sigma_xx
-
     # Compute pairwise distances
     coords = np.array([[node.x, node.y, node.z] for node in self.nodes])
     self.dists = scipy.spatial.distance.cdist(coords, coords)
@@ -493,32 +495,31 @@ class GlobalSystemThreshold():
     self.H0_global = scipy.sparse.csr_matrix(self.H0_global)
     self.k0_global = np.array([self.nodes[i].k0 for i in range(num_blocks)])
 
-    ''' Cache mechanical equilibrium operators for top node
+    ''' Cache mechanical equilibrium operators for all nodes
     Mechanical equilibrium is achieved by venting mass down to elastic
     equilibrium, without change to the viscous displacement for the given node.
     The equilibrium displacement field is given by
       u_eq = H_mod @ q_loc + k_mod.squeeze()
     '''
-    top_node = self.nodes[-1]
-    # Outer product matrix representing effect of mass on bdry displacement
-    outer = scipy.sparse.lil_matrix((Nr, Nr,))
-    outer[:,0] = 3 * top_node.m0 / top_node.R0 * top_node.H[:,self.data_slice["mass"]]
-    # Compute operator q -> m_equilibrium, with the form m_eq = H_mod @ q + k_mod
-    H_mod = scipy.sparse.linalg.spsolve_triangular(
-      scipy.sparse.eye(Nr, Nr) - outer, top_node.H.todense(), lower=True)
-    # Compute modified k
-    k_mod =  scipy.sparse.linalg.spsolve_triangular(
-      scipy.sparse.eye(Nr, Nr) - outer, top_node.k, lower=True)
-    # Move dependence on mass in input q to dependence on m0
-    k_mod += H_mod[:, self.data_slice["mass"]] * top_node.m0
-    H_mod[:, self.data_slice["mass"]] = 0
-    # Finalize types of H, k
-    H_mod = scipy.sparse.csr_matrix(H_mod)
-    # Attach H_mod, k_mod to top node
-    self.nodes[-1].H_mod = H_mod
-    self.nodes[-1].k_mod = k_mod
+    for i, node in enumerate(self.nodes):
+      # Outer product matrix representing effect of mass on bdry displacement
+      outer = scipy.sparse.lil_matrix((Nr, Nr,))
+      outer[:,0] = 3 * node.m0 / node.R0 * node.H[:,self.data_slice["mass"]]
+      # Compute operator q -> m_equilibrium, with the form m_eq = H_mod @ q + k_mod
+      H_mod = scipy.sparse.linalg.spsolve_triangular(
+        scipy.sparse.eye(Nr, Nr) - outer, node.H.todense(), lower=True)
+      # Compute modified k
+      k_mod =  scipy.sparse.linalg.spsolve_triangular(
+        scipy.sparse.eye(Nr, Nr) - outer, node.k, lower=True)
+      # Move dependence on mass in input q to dependence on m0
+      k_mod += H_mod[:, self.data_slice["mass"]] * node.m0
+      H_mod[:, self.data_slice["mass"]] = 0
+      # Attach H_mod, k_mod to node
+      node.H_mod = scipy.sparse.csr_matrix(H_mod)
+      node.k_mod = k_mod
 
-  def _init_node(self, node) -> None:
+  def _init_node(self, node, K_crust=None, G_crust=None, K_f=None,
+                 t_d=None, t_b=None) -> None:
     ''' Initializes node by allocating the linear elasticity affine mapping
     and recording the current m, R as the linearization point.
     
@@ -546,25 +547,41 @@ class GlobalSystemThreshold():
     '''
 
     # Add variables to scope
-    Nr = self.Nr
     block_size = self.block_size
     R_outer_ratio = self.R_outer_ratio
-    K_f = self.K_f
-    M_crust, K_crust, G_crust, = (self.M_crust, self.K_crust, self.G_crust,)
 
-    # Set up mesh
+    # Read properties from args, else use global default
+    node.Nr      = self.Nr
+    node.K_crust = self.K_crust if K_crust is None else K_crust
+    node.G_crust = self.G_crust if G_crust is None else G_crust
+    node.K_f     = self.K_f     if K_f is None else K_f
+    node.t_d     = self.t_d     if t_d is None else t_d
+    node.t_b     = self.t_b     if t_b is None else t_b 
+    # Compute dependent quantities
+    node.M_crust = node.K_crust + (4.0 / 3.0) * node.G_crust
+    
+    # Unpack self properties
+    Nr, K_crust, G_crust, M_crust, K_f, t_d, t_b = \
+      node.Nr, node.K_crust, node.G_crust, node.M_crust, node.K_f, node.t_d, node.t_b
+
     m0 = node.m
     R0 = (node.V / (4*np.pi/3))**(1.0/3.0)
+    # Set up mesh
+    # Set maximum r-coordinate to approximate BC at infinity
     R_inf = R_outer_ratio * R0
+    # Compute dx
     dx = (R_inf - R0) / (Nr-1)
+    # Set mesh points in r-coordinate
     r_mesh = np.linspace(R0, R_inf, Nr)
     # Define diagonal matrix of values 1/r
     r_mesh_inv = scipy.sparse.diags([1.0 / r_mesh], [0])
 
     ''' Local differentiation construction '''
-    # Matrix construction
+    # Construct second-order derivative operator (units 1/length^2)
     A = op_A(dx, Nr, r_mesh)
+    # Construct first-order central derivative operator (units 1/length)
     D = op_D(dx, Nr)
+    # Construct diagonal matrix 1/r
     diag_inv_r = scipy.sparse.diags([1.0/r_mesh], [0])
 
     ''' Compute mapping L_u from viscous strains to displacements '''
@@ -626,12 +643,12 @@ class GlobalSystemThreshold():
 
     # Assemble dependence of viscous strain evolution on displacement u (through elastic strain)
     G = scipy.sparse.lil_matrix((block_size, Nr))
-    G[0:Nr, 0:Nr] = -1.0 / self.t_d * op_E_drr(dx, Nr, r_mesh)
-    G[Nr:2*Nr, 0:Nr] = -1.0 / self.t_b * op_E_kk(dx, Nr, r_mesh)
+    G[0:Nr, 0:Nr] = -1.0 / node.t_d * op_E_drr(dx, Nr, r_mesh)
+    G[Nr:2*Nr, 0:Nr] = -1.0 / node.t_b * op_E_kk(dx, Nr, r_mesh)
     # Compute matrix L
     node.L = scipy.sparse.lil_matrix((block_size, block_size))
-    node.L[np.arange(0,Nr), np.arange(0,Nr)] = (1 / self.t_d)
-    node.L[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / self.t_b)
+    node.L[np.arange(0,Nr), np.arange(0,Nr)] = (1 / node.t_d)
+    node.L[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / node.t_b)
     # Add dependence on u through Schur complement term
     node.L += G @ node.H
 
@@ -729,10 +746,17 @@ class GlobalSystemThreshold():
         if threshold_factor > 1 or threshold_factor < 0:
           raise ValueError
         if threshold_factor > 1e-15:
+          # Set upstream properties for flow
+          if p_node[i] > p_node[j]:
+            rho = self.nodes[i].rho0
+            K_f = self.nodes[i].K_f
+          else:
+            rho = self.nodes[j].rho0
+            K_f = self.nodes[j].K_f
           # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
           Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
           # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-          tups.append((i, j, Y * self.rho0 * self.K_f,))
+          tups.append((i, j, Y * rho * K_f,))
 
     return tups
 
@@ -770,44 +794,56 @@ class GlobalSystemThreshold():
 
     '''
 
-    # Compute pressures
-    p_node = self.pressure(q)
+    # # Compute pressures
+    # p_node = self.pressure(q)
 
-    # Allocate global M matrix
-    M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
+    # # Allocate global M matrix
+    # M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
 
-    # For each edge (i,j) there is a block matrix representing the connectivity
-    # between the pair
+    # # For each edge (i,j) there is a block matrix representing the connectivity
+    # # between the pair
 
-    for i in range(num_blocks):
-      node_i = self.nodes[i]
-      for j in range(i+1, num_blocks):
-        node_j = self.nodes[j]
-        dist = self.dists[i,j]
-        if dist > self.max_edge_dist:
-          continue
-        # Compute average pressure gradient
-        dpdx = (p_node[i] - p_node[j]) / dist
-        # Factor between (0, 1) that modulates flow between the two chambers
-        threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
-                                    self.dpdx_threshold_scale))
-        if threshold_factor > 1 or threshold_factor < 0:
-          raise ValueError
-        if threshold_factor > 1e-15:
-          # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
-          Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
-          # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-          M += (Y * self.rho0 * self.K_f) * self.M_stencils[(i,j,)]
+    # for i in range(num_blocks):
+    #   node_i = self.nodes[i]
+    #   for j in range(i+1, num_blocks):
+    #     node_j = self.nodes[j]
+    #     if self.dists[i,j] > self.max_edge_dist:
+    #       continue
+    #     # Compute average pressure gradient
+    #     dpdx = (p_node[i] - p_node[j]) / self.dists[i,j]
+    #     # Factor between (0, 1) that modulates flow between the two chambers
+    #     threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
+    #                                 self.dpdx_threshold_scale))
+    #     if threshold_factor > 1 or threshold_factor < 0:
+    #       raise ValueError
+    #     if threshold_factor > 1e-15:
+          
+    #       if p_node[i] > p_node[j]:
+    #         rho = node_i.rho0
+    #         K_f = node_i.K_f
+    #       else:
+    #         rho = node_j.rho0
+    #         K_f = node_j.K_f
+
+    #       # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
+    #       Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
+
+    #       # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
+    #       M += (Y * rho * K_f) * self.M_stencils[(i,j,)]
+
+    mass_rates, M = self.mass_rates(q, return_M=True)
 
     if skip_Lf:
       return M
     else:
       return L, M, f
 
-  def mass_rates(self, q):
+  def mass_rates(self, q, return_M=False):
     ''' Compute the strictly lower triangular outgoing mass transfer matrix M,
     where M[i,j] represents the mass rate from j to i through edge (i,j),
     where the mass rate is nonnegative.
+
+    If return_M is true, also returns the M matrix representing mass transfer.
     
     Properties:
       * Entries of M are >= 0
@@ -822,6 +858,8 @@ class GlobalSystemThreshold():
     # Allocate mass rates from j to i
     mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
     
+    # Allocate global M matrix
+    M_global = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
     for i in range(num_blocks):
       M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
       for j in range(i+1, num_blocks):
@@ -835,16 +873,27 @@ class GlobalSystemThreshold():
         if threshold_factor > 1 or threshold_factor < 0:
           raise ValueError
         if threshold_factor > 1e-15:
+          # Set upstream properties for flow
+          if p_node[i] > p_node[j]:
+            rho = self.nodes[i].rho0
+            K_f = self.nodes[i].K_f
+          else:
+            rho = self.nodes[j].rho0
+            K_f = self.nodes[j].K_f
           # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
           Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / self.dists[i,j]
           # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-          M += (Y * self.rho0 * self.K_f) * self.M_stencils[(i,j,)]
+          M += (Y * rho * K_f) * self.M_stencils[(i,j,)]
+          M_global += (Y * rho * K_f) * self.M_stencils[(i,j,)]
       mass_rates[:,i] = -(M @ q)[self.mass_indices].squeeze()
     
     # Remove diagonal
     mass_rates[np.arange(0, num_blocks), np.arange(0, num_blocks)] = 0
 
-    return mass_rates
+    if return_M:
+      return mass_rates, M
+    else:
+      return mass_rates
 
   def pressure(self, q):
     ''' Compute vector of pressures, indexed by chamber number '''
@@ -857,9 +906,9 @@ class GlobalSystemThreshold():
       # Compute boundary displacement
       # u_R0 = np.dot(node.H0, q[i*self.block_size:(i+1)*self.block_size]) + node.k0
       # u_R0 = (node.H @ q[i*self.block_size:(i+1)*self.block_size] + node.k)[0]
-      dp_u = -3 * self.K_f * wall_displacement[i] / node.R0
+      dp_u = -3 * node.K_f * wall_displacement[i] / node.R0
       # Pressure increase contribution due to added mass (m0 may be node-dependent)
-      dp_m = self.K_f * ((m[i] - node.m0) / node.m0)
+      dp_m = node.K_f * ((m[i] - node.m0) / node.m0)
       p[i] = node.p0 + dp_u + dp_m
     return p
 
@@ -880,7 +929,7 @@ class GlobalSystemThreshold():
       # Compute boundary displacement
       u_loc = (node.H @ q_loc + node.k.squeeze())
       # Radial component of strain
-      radial = (op_D(node.dx, self.Nr) @ u_loc)
+      radial = (op_D(node.dx, node.Nr) @ u_loc)
       # Angular components (phi + theta) of stress div. by M_crust
       angular = u_loc / node.r_mesh
       # Elastic strain
@@ -891,8 +940,8 @@ class GlobalSystemThreshold():
       # Viscous strain γ_drr
       gamma_kk = q_loc[self.Nr:2*self.Nr]
       # Compute stress from elastic strain
-      sigma_drr = 2 * self.G_crust * (eps_drr - gamma_drr)
-      sigma_kk = 3 * self.K_crust * (eps_kk - gamma_kk)
+      sigma_drr = 2 * node.G_crust * (eps_drr - gamma_drr)
+      sigma_kk = 3 * node.K_crust * (eps_kk - gamma_kk)
       sigma_rr[i,:] = sigma_drr + (1.0/3.0) * sigma_kk
     return sigma_rr
 
@@ -933,7 +982,7 @@ class GlobalSystemThreshold():
     return plt.matshow(np.log10(np.abs(L).todense()), cmap=plt.cm.Blues)
 
   @staticmethod
-  def eigshow(eig):
+  def eigshow(eig, t_d, t_b):
     ''' Eigenvalue plot on complex plane '''
     plt.subplot(1,2,1)
     plt.plot(1/t_d, 0, '^r')
@@ -1029,12 +1078,11 @@ class GlobalSystemThreshold():
       u[i,:] = (self.H0_global @ q[i,:]).ravel() + self.k0_global
     # Compute pressure node-by-node
     for j, node in enumerate(self.nodes):
-      dp_u = -3 * self.K_f * u[:,j] / node.R0
-      dp_m = self.K_f * ((m[:,j] - node.m0) / node.m0)
+      dp_u = -3 * node.K_f * u[:,j] / node.R0
+      dp_m = node.K_f * ((m[:,j] - node.m0) / node.m0)
       p[:,j] = node.p0 + dp_u + dp_m
 
     return m, p, u
-
 
   def create_single_mass_injection_source(self, mdot_inj):
     def f(t, q):
@@ -1050,8 +1098,34 @@ class GlobalSystemThreshold():
       f_inj[self.data_slice_global(0, "mass")] = fn(t, q)
       return f_inj
     return f
+  
+  def create_mass_injection_layer(self, fn_z=None, z_max=-30e3, mdot_inj=1.0):
+    ''' Adds mass injection to all chambers according to given function
+      fn_z(t, q, z),
+    where z is the depth of the chamber. If fn_z not provided, uses default
+    uniform distribution below threshold depth z_max at rate mdot_inj. '''
+
+    z_nodes = [node.z for node in self.nodes]
+    if fn_z is None:
+
+      i_z_nodes = [(i, z) for i, z in enumerate(z_nodes) if z <= z_max]
+
+      def f_uniform_depth(t, q):
+        f_inj = np.zeros((self.num_dof))
+        for i, z in enumerate(i_z_nodes):
+          f_inj[self.data_slice_global(i, "mass")] = mdot_inj
+        return f_inj
+      return f_uniform_depth
+
+    def f(t, q):
+      f_inj = np.zeros((self.num_dof))
+      for i, z in enumerate(z_nodes):
+        f_inj[self.data_slice_global(i, "mass")] = fn_z(t, q, z)
+      return f_inj
+    return f
 
   def create_row_mass_injection_source(self, mdot_inj, nodes_per_layer:list):
+    ''' Create row of injection sources splitting mdot_inj between them. '''
     def f(t, q):
       f_inj = np.zeros((self.num_dof))
       # Count nodes in the bottom layer for an N-way split
@@ -1068,7 +1142,7 @@ class GlobalSystemThreshold():
       # Compute overpressure for node 0
       deltap = feed_overpressure - (p_node[0] - self.nodes[0].p0)
       # Compute injection rate by flow rule
-      injection_rate = self.rho0 * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
+      injection_rate = self.nodes[0].rho0 * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
       f_inj[self.data_slice_global(0, "mass")] = injection_rate
       return f_inj
     return f
@@ -1085,6 +1159,53 @@ class GlobalSystemThreshold():
         # Set eruption rate in mass conservation equation
         f_erupt[self.data_slice_global(-1, "mass")] = -eruption_rate
       return f_erupt
+    
+    # Set indices of eruptibe nodes
+    return f
+
+  def create_eruptible_layer(self,
+                             p_erupt_min=5e6,
+                             p_erupt_max=10e6,
+                             z_min=-5e6,
+                             z_max=0.0,
+                             mu_erupt= 1e5,
+                             r_conduit = 25, distr_method="linear"):
+    
+    ''' Return a function that computes the eruption rate for an eruptible layer.
+    The eruptible layer assigns an eruption pressure to a layer bounded by
+      (z_min, z_max)
+    with critical eruption overpressure of
+      (p_erupt_max, p_erupt_min)
+    corresponding to the bottom and top of the layer, respectively.
+    '''
+
+    if distr_method == "linear":
+      # Array of index-depth-pressure tuples for each node in eruptible layer 
+      i_z_p_nodes = [(i,
+                      node.z,
+                      p_erupt_max + (node.z - z_min) / (z_max - z_min)
+                        * (p_erupt_min - p_erupt_max))
+                    for i, node in enumerate(self.nodes)
+                    if node.z >= z_min and node.z <= z_max]
+    else:
+      raise ValueError(
+        f"Eruption-pressure distribution method {distr_method} not recognized.")
+
+    def f(t, q):
+      ''' Compute eruption rate of all chambers '''
+      p_node = self.pressure(q)
+      # Allocate
+      f_erupt = np.zeros((self.num_dof))
+      # Compute pressure in excess of critical eruption overpressure
+      for i, (node_idx, z, p_erupt) in enumerate(i_z_p_nodes):
+        deltap = (p_node[node_idx] - self.nodes[node_idx].p0) - p_erupt
+        if deltap > 0:
+          eruption_rate = self.rho0 * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+          # Set eruption rate in mass conservation equation
+          f_erupt[self.data_slice_global(node_idx, "mass")] = -eruption_rate
+      return f_erupt
+    
+    f.i_z_p_nodes = i_z_p_nodes    
     return f
 
   def simulation(self, q0, t_vec, f_inject:callable, f_erupt:callable, method_order=1,
@@ -1475,6 +1596,8 @@ class GlobalSystemThreshold():
 
 
 if __name__ == "__main__":
+
+  # Dev / debug script
 
   for i in range(len(p_outs)):
     plt.loglog(t_outs[i], p_outs[i][:,-1] / 1e6, '.-', label=f"${N_range[i]} \\times {N_range[i]}$")
