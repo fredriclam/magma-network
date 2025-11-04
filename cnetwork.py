@@ -167,8 +167,10 @@ class MagmaChamber(Node):
     # Parse setting objects: pressure
     self.p_init = np.nan
     if p_setting is None:
+      # Set initial pressure to lithostatic
       self.p_init = p_lithostatic(z)
     elif isinstance(p_setting, (int, float)):
+      # Set initial pressure to a specified value
       self.p_init = p_setting
     else:
       try:
@@ -179,11 +181,14 @@ class MagmaChamber(Node):
       except AttributeError as e:
         print("setting object must contain field `mode` and `value`.")
         raise ValueError from e
+    
     # Parse setting objects: temperature
     self.T_init = np.nan
     if T_setting is None:
+      # Set initial temperature to geothermal gradient (this should be solid/cold)
       self.T_init = T_geothermal(z)
     elif isinstance(T_setting, (int, float),):
+      # Set initial temperature to a specified value
       self.T_init = T_setting
     else:
       try:
@@ -258,8 +263,10 @@ class MagmaChamber(Node):
   ''' Dependent quantities as object properties '''
 
   @property
-  def U(self) -> np.array:
-    ''' Vector of dependent variables U = [m, E, V] '''
+  def _U(self) -> np.array:
+    ''' Vector of dependent variables U = [m, E, V].
+    Private attribute (unused at the moment).
+    '''
     return np.array([self.m, self.E, self.V])
 
   @property
@@ -324,8 +331,6 @@ class GlobalSystemThreshold():
   ''' Global coupled system of chambers with methods for manipulating the network.
 
   Heterogeneous properties of the chamber network are accepted.
-
-
   '''
 
   # Define schema for data shape
@@ -387,6 +392,7 @@ class GlobalSystemThreshold():
 
   def __init__(self, nodes:list, t_b, t_d, K_crust, G_crust, r_hydr, mu0,
                rho0=2500, K_f=10e9, Nr=50,
+               p_crit=1e3, p_threshold_scale=1e2,
                dpdx_crit=1e3, dpdx_threshold_scale=1e2, R_outer_ratio=20,
                max_edge_dist=np.inf, remote_sigma_xx=0.0):
     self.nodes:list = nodes
@@ -664,8 +670,17 @@ class GlobalSystemThreshold():
     # Save reference to system matrix
     # node.L_u = L_u
 
-  def get_connectivity(self, q):
-    ''' Signed connectivity matrix with units of admittance ( (m/s) / Pa ) '''
+  def get_connectivity(self, q, threshold="gradient"):
+    ''' 
+    Positive connectivity matrix with units of admittance ( (m/s) / Pa )
+    Nonzero values appear on either the upper diagonal (i -> j) or lower
+    diagonal (j -> i).
+
+    Legacy wrapper for self.mass_rates(q, return_format="Y").
+    '''
+
+    return self.mass_rates(q, return_format="Y", threshold=threshold)
+  
     # Get system size information
     Nr, num_blocks, block_size = self.Nr, self.num_blocks, self.block_size
     # Compute pressures
@@ -706,172 +721,113 @@ class GlobalSystemThreshold():
 
     return Y
 
-  def compute_mass_vecs(self, q,):
-    ''' Copied from below..
-      Add mass transfer terms
-
-    Pressure differences between chambers are
-    p_i - p_j = -(K_fi - K_fj) - (3 K_fi u_ri / R_i - 3 K_fj u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
-    and mass rate ~ rho_upstream * hyd_cond * (p_i - p_j).
-
-    Here we estimate
-    p_i - p_j = - 3 * K_f (u_ri / R_i - u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
-    and thus
-    \dot{m}_{ij} = Adj_{ij} * hydr_cond * rho0 * K_f * (
-      - 3 * (u_ri / R_i - u_rj / R_j) + (m_i/m_0i - m_j/m_0j)
-    )
-    where Adj is the adjacency matrix. Here the hydraulic conductivity has units of
-    mass flux per pressure; that is, (m^3/s)/Pa in SI units.
-
-    '''
-
-    # Get system size information
-    num_blocks, block_size = self.num_blocks, self.block_size
-    
-    # Compute pressures
-    p_node = self.pressure(q)
-
-    tups = []
-
-    for i in range(num_blocks):
-      for j in range(i+1, num_blocks):
-        dist = self.dists[i,j]
-        if dist > self.max_edge_dist:
-          continue
-        # Compute average pressure gradient
-        dpdx = (p_node[i] - p_node[j]) / dist
-        # Factor between (0, 1) that modulates flow between the two chambers
-        threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
-                                    self.dpdx_threshold_scale))
-        if threshold_factor > 1 or threshold_factor < 0:
-          raise ValueError
-        if threshold_factor > 1e-15:
-          # Set upstream properties for flow
-          if p_node[i] > p_node[j]:
-            rho = self.nodes[i].rho0
-            K_f = self.nodes[i].K_f
-          else:
-            rho = self.nodes[j].rho0
-            K_f = self.nodes[j].K_f
-          # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
-          Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
-          # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-          tups.append((i, j, Y * rho * K_f,))
-
-    return tups
-
-  def assemble_global_LMf(self, q, skip_Lf=False):
+  def assemble_global_Lf(self, q):
     ''' Assemble global matrix, coupling all chambers. The ODE system is
         (dq/dt) + L @ q + M(q) @ q = f,
         where L captures the viscoelastic effect and M captures mass transfer.
     '''
-
-    # Get system size information
+    # Abbreviate system size information
     num_blocks, block_size = self.num_blocks, self.block_size
-
     # Allocate global L, f matrices
-    if not skip_Lf:
-      L = scipy.sparse.lil_matrix((num_blocks * block_size, num_blocks * block_size))
-      f = scipy.sparse.lil_matrix((num_blocks * block_size, 1))
-      for i, node in enumerate(self.nodes):
-        L[i*block_size:(i+1)*block_size, i*block_size:(i+1)*block_size] = node.L
-        f[i*block_size:(i+1)*block_size,0] = node.f
+    L = scipy.sparse.lil_matrix((num_blocks * block_size, num_blocks * block_size))
+    f = scipy.sparse.lil_matrix((num_blocks * block_size, 1))
+    for i, node in enumerate(self.nodes):
+      L[i*block_size:(i+1)*block_size, i*block_size:(i+1)*block_size] = node.L
+      f[i*block_size:(i+1)*block_size,0] = node.f
+    return L, f
 
-    ''' Add mass transfer terms
-
-    Pressure differences between chambers are
-    p_i - p_j = -(K_fi - K_fj) - (3 K_fi u_ri / R_i - 3 K_fj u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
-    and mass rate ~ rho_upstream * hyd_cond * (p_i - p_j).
-
-    Here we estimate
-    p_i - p_j = - 3 * K_f (u_ri / R_i - u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
-    and thus
-    \dot{m}_{ij} = Adj_{ij} * hydr_cond * rho0 * K_f * (
-      - 3 * (u_ri / R_i - u_rj / R_j) + (m_i/m_0i - m_j/m_0j)
-    )
-    where Adj is the adjacency matrix. Here the hydraulic conductivity has units of
-    mass flux per pressure; that is, (m^3/s)/Pa in SI units.
-
-    '''
-
-    # # Compute pressures
-    # p_node = self.pressure(q)
-
-    # # Allocate global M matrix
-    # M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
-
-    # # For each edge (i,j) there is a block matrix representing the connectivity
-    # # between the pair
-
-    # for i in range(num_blocks):
-    #   node_i = self.nodes[i]
-    #   for j in range(i+1, num_blocks):
-    #     node_j = self.nodes[j]
-    #     if self.dists[i,j] > self.max_edge_dist:
-    #       continue
-    #     # Compute average pressure gradient
-    #     dpdx = (p_node[i] - p_node[j]) / self.dists[i,j]
-    #     # Factor between (0, 1) that modulates flow between the two chambers
-    #     threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
-    #                                 self.dpdx_threshold_scale))
-    #     if threshold_factor > 1 or threshold_factor < 0:
-    #       raise ValueError
-    #     if threshold_factor > 1e-15:
-          
-    #       if p_node[i] > p_node[j]:
-    #         rho = node_i.rho0
-    #         K_f = node_i.K_f
-    #       else:
-    #         rho = node_j.rho0
-    #         K_f = node_j.K_f
-
-    #       # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
-    #       Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
-
-    #       # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-    #       M += (Y * rho * K_f) * self.M_stencils[(i,j,)]
-
-    mass_rates, M = self.mass_rates(q, return_M=True)
-
-    if skip_Lf:
-      return M
-    else:
-      return L, M, f
-
-  def mass_rates(self, q, return_M=False):
+  def mass_rates(self, q, return_format=None, threshold="gradient"):
     ''' Compute the strictly lower triangular outgoing mass transfer matrix M,
     where M[i,j] represents the mass rate from j to i through edge (i,j),
     where the mass rate is nonnegative.
 
-    If return_M is true, also returns the M matrix representing mass transfer.
+    Parameter return_format sets the output format:
+      * None: default return (mass_rates matrix)
+      * "M": global mass transfer matrix, such that M@q is the mass_rates matrix
+      * "tups": mass transfer rates in tuple format (i, j, mass rate)
     
-    Properties:
+    Parameter threshold sets the physical threshold:
+      * "gradient" (default): Threshold is set based on gradient |p_i - p_j| / dz
+      * "absdiff": Threshold is set based on absolute pressure difference |p_i - p_j|
+      * "fracture": Threshold is set based on local overpressure p_i - p_lithostatic
+
+    Properties of output matrix if return_format is None:
       * Entries of M are >= 0
       * Column sums of M give the rate of mass leaving node j
       * Row sums of M give the rate of mass entering node i
       * M - M.T is the full antisymmetric mass transfer matrix, such that
-          (M - M.T).sum(axis=1) is the vector (dm/dt) for each row i. '''
+          (M - M.T).sum(axis=1) is the vector (dm/dt) for each row i.
+          
+    Legacy docs:
+
+      Pressure differences between chambers are
+      p_i - p_j = -(K_fi - K_fj) - (3 K_fi u_ri / R_i - 3 K_fj u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
+      and mass rate ~ rho_upstream * hyd_cond * (p_i - p_j).
+
+      Here we estimate
+      p_i - p_j = - 3 * K_f (u_ri / R_i - u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
+      and thus
+      \dot{m}_{ij} = Adj_{ij} * hydr_cond * rho0 * K_f * (
+        - 3 * (u_ri / R_i - u_rj / R_j) + (m_i/m_0i - m_j/m_0j)
+      )
+      where Adj is the adjacency matrix. Here the hydraulic conductivity has units of
+      mass flux per pressure; that is, (m^3/s)/Pa in SI units.
+
+      '''
     # Get system size information
     num_blocks, block_size = self.num_blocks, self.block_size
+    
+    # Allocate variable for the specified return format
+    if return_format == "tups":
+      # Allocate output tuples
+      tups = []
+    elif return_format == "M":
+      # Allocate global M matrix
+      M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
+    elif return_format == "Y":
+      # Allocate dense conductivity ((m/s)/Pa) matrix, upper triangular
+      Y_matrix = np.zeros((num_blocks, num_blocks))
+    elif return_format is None:
+      # Allocate mass rates from j to i
+      mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
+    else:
+      raise ValueError(f"Invalid return_format passed to mass_rates. ('tups'|'M'|'Y'|None)")
+    
     # Compute pressures
     p_node = self.pressure(q)
-    # Allocate mass rates from j to i
-    mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
     
-    # Allocate global M matrix
-    M_global = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
     for i in range(num_blocks):
-      M = scipy.sparse.csr_matrix((num_blocks * block_size, num_blocks * block_size))
       for j in range(i+1, num_blocks):
         if self.dists[i,j] > self.max_edge_dist:
           continue
         # Compute average pressure gradient between self.nodes[i] and self.nodes[j]
         dpdx = (p_node[i] - p_node[j]) / self.dists[i,j]
-        # Factor between (0, 1) that modulates flow between the two chambers
-        threshold_factor = float(smoother(np.abs(dpdx) - self.dpdx_crit,
-                                    self.dpdx_threshold_scale))
-        if threshold_factor > 1 or threshold_factor < 0:
-          raise ValueError
+        # Hydrostatic pressure difference divided by distance
+        dpdx_hydro = 0.5 * (self.nodes[i].rho0 + self.nodes[j].rho0) * g * (
+          (self.nodes[i].z - self.nodes[j].z) / self.dists[i,j])
+        # Account for hydrostatic pressure gradient
+        dpdx += dpdx_hydro
+
+        # Resolve remote tensile stress in x-direction
+        opening_stress = self.remote_sigma_xx \
+          * np.abs(self.nodes[i].z - self.nodes[j].z) / self.dists[i,j]
+        # Effective critical pressure gradient for opening
+        dpdx_crit_eff = self.dpdx_crit - opening_stress
+
+        ''' Compute threshold factor between [0, 1] '''
+        if threshold == "gradient":
+          if dpdx_crit_eff <= 0:
+            threshold_factor = 1.0
+          else:
+            # Factor between (0, 1) that modulates flow between the two chambers
+            threshold_factor = float(smoother(np.abs(dpdx) - dpdx_crit_eff,
+                                        self.dpdx_threshold_scale))
+            if threshold_factor > 1 or threshold_factor < 0:
+              raise ValueError
+        else:
+          raise ValueError(
+            f"Unknown threshold '{threshold}'. Use ('gradient'|'absdiff'|'fracture')")        
+
         if threshold_factor > 1e-15:
           # Set upstream properties for flow
           if p_node[i] > p_node[j]:
@@ -880,19 +836,38 @@ class GlobalSystemThreshold():
           else:
             rho = self.nodes[j].rho0
             K_f = self.nodes[j].K_f
-          # Compute flow admittance ( (m/s) / Pa ) -- sign is determined automatically by multiplication with state vector q
+          # Compute flow admittance ( (m/s) / Pa )
+          #   sign is determined automatically by multiplication with state vector q
           Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / self.dists[i,j]
-          # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M_loc
-          M += (Y * rho * K_f) * self.M_stencils[(i,j,)]
-          M_global += (Y * rho * K_f) * self.M_stencils[(i,j,)]
-      mass_rates[:,i] = -(M @ q)[self.mass_indices].squeeze()
-    
-    # Remove diagonal
-    mass_rates[np.arange(0, num_blocks), np.arange(0, num_blocks)] = 0
+          # Multiply upstream density and bulk modulus to units (mass areal flux)
+          mflux = Y * rho * K_f
+          if return_format == "tups":
+            tups.append((i, j, mflux,))
+          elif return_format == "M":
+            # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M
+            M += mflux * self.M_stencils[(i,j,)]
+          elif return_format == "Y":
+            if Y > 0:
+              Y_matrix[i,j] = Y
+            elif Y < 0:
+              Y_matrix[j,i] = -Y
+          else:
+            # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M
+            mass_rates[:,i] = mflux * (
+              self.M_stencils[(i,j,)] @ q)[self.mass_indices].squeeze()
+      
+      # if not (return_format == "tups" or return_format == "M"):
+        # mass_rates[:,i] = -(M @ q)[self.mass_indices].squeeze()
 
-    if return_M:
-      return mass_rates, M
+    if return_format == "tups":
+      return tups
+    elif return_format == "M":
+      return M
+    elif return_format == "Y":
+      return Y_matrix
     else:
+      # Remove diagonal for mass transfer
+      mass_rates[np.arange(0, num_blocks), np.arange(0, num_blocks)] = 0
       return mass_rates
 
   def pressure(self, q):
@@ -1229,7 +1204,8 @@ class GlobalSystemThreshold():
     self._step_strategy = np.zeros(t_vec.size, dtype=float)
 
     # Assemble L, M(t = 0), and f
-    L, M, f = self.assemble_global_LMf(q)
+    L, f = self.assemble_global_Lf(q)
+    M = self.mass_rates(q, return_format="M")
     f = f.toarray()
 
     m_erupted = 0.0
@@ -1299,7 +1275,7 @@ class GlobalSystemThreshold():
         RHS = q + dt * f_tot
         if solve_full_matrix:
           # Construct LHS matrix for backward Euler
-          M = self.assemble_global_LMf(q, skip_Lf=True)
+          M = self.mass_rates(q, return_format="M")
           LHS_BE = scipy.sparse.eye(self.num_dof) + dt * (L + M)
           # Construct RHS data
           # Quasi-implicit one-step solve (strictly M(q^n) is used instead of M(q^n+1))
@@ -1308,7 +1284,7 @@ class GlobalSystemThreshold():
           q = np.reshape(q, (self.num_dof, 1))
         else:
           # Compute tuples (i, j, mass_rate_scaling)
-          mass_transfer_tuples = self.compute_mass_vecs(q)
+          mass_transfer_tuples = self.mass_rates(q, return_format="tups")
           U = np.zeros((self.num_dof, len(mass_transfer_tuples)))
           V = np.zeros((len(mass_transfer_tuples), self.num_dof))
           for edge_idx, (i, j, mdot_scaling) in enumerate(mass_transfer_tuples):
@@ -1321,7 +1297,7 @@ class GlobalSystemThreshold():
 
           if check_residual:
             # Construct LHS matrix for backward Euler
-            M = self.assemble_global_LMf(q, skip_Lf=True)
+            M = self.mass_rates(q, return_format="M")
             LHS_BE = scipy.sparse.eye(self.num_dof) + dt * (L + M)          
             res = np.linalg.norm((_scaling_mat_inv @ (LHS_BE @ q_lr - RHS)).squeeze())
             self.residuals[time_index] = res
@@ -1490,7 +1466,7 @@ class GlobalSystemThreshold():
       # Load q, pressure from ODE solution
       q = q_out[i,...]
 
-      p_node = self.pressure(q) # TODO: pressure history
+      p_node = self.pressure(q)
 
       # Compute turnover rates (mdot / m)
       turnover_rates = scipy.sparse.diags(1/q[self.mass_indices].squeeze()) @ self.mass_rates(q)
