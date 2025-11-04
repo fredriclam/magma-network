@@ -112,16 +112,34 @@ def op_A(h, Nr, r_mesh):
         - 2.0 * diag_inv_r * diag_inv_r)
   return A
 
-def prop_factory(t_b=1e11, t_d=5e10, K_crust=10e9, G_crust=10e9,
-                 K_f=10e9, mu0=1e6, r_hydr=5):
+def default_props(r_hydr_default=5, mu_default=1e6,
+                  t_b_default=1e11, t_d_default=5e10,
+                  K_crust_default=10e9, G_crust_default=10e9,
+                  K_f_default=10e9,):
+  ''' Package and return default material properties as a dictionary.
+  Keyword arguments provided override the specified property in the returned
+  dictionary.
+  '''
+
   return dict(
-    t_b = t_b,     # Set Maxwell times
-    t_d = t_d,     # Set Maxwell times
-    K_crust = K_crust,
-    G_crust = G_crust,
-    K_f = K_f,
-    mu0 = mu0,      # Constant viscosity assumption
-    r_hydr = r_hydr,     # Effective hydraulic radius
+    r_hydr_default = r_hydr_default,     # Effective hydraulic radius
+    mu_default = mu_default,             # Constant viscosity assumption
+    t_b_default = t_b_default,           # Set Maxwell times
+    t_d_default = t_d_default,           # Set Maxwell times
+    K_crust_default = K_crust_default,
+    G_crust_default = G_crust_default,
+    K_f_default = K_f_default,
+  )
+
+def default_numerics(Nr=50, R_outer_ratio=20):
+  ''' Package and return default numerical settings as a dictionary.
+  Keyword arguments provided override the specified property in the returned
+  dictionary.
+  '''
+
+  return dict(
+    Nr = Nr,                              # Number of cells in r-coordinate
+    R_outer_ratio = R_outer_ratio,        # R_max / R_min
   )
 
 class MagmaChamber(Node):
@@ -154,7 +172,7 @@ class MagmaChamber(Node):
     self.c_v = c_v # Specific heat capacity (J/kg K)
     self.K = K
     self.vref = vref
-    self.rhoref = 1.0/vref
+    self.rhoref = 1.0 / vref
     self.pref = pref
     self.g = g
 
@@ -389,41 +407,56 @@ class GlobalSystemThreshold():
       raise ValueError("Data schema seems invalid. The location of data in the "
                       + "state vector for a single chamber may be invalid.")
 
-  def __init__(self, nodes:list, t_b, t_d, K_crust, G_crust, r_hydr, mu0,
-               K_f=10e9, Nr=50,
-               p_crit=1e3, p_threshold_scale=1e2,
-               dpdx_crit=1e3, dpdx_threshold_scale=1e2, R_outer_ratio=20,
-               max_edge_dist=np.inf, remote_sigma_xx=0.0):
+  def __init__(self,
+              nodes:list,
+              r_hydr_default=5,
+              mu_default=1e6,
+              t_b_default=1e11,
+              t_d_default=5e10,
+              K_crust_default=10e9,
+              G_crust_default=10e9,
+              K_f_default=10e9,
+              Nr=50,
+              R_outer_ratio=20,
+              p_crit=1e3, p_threshold_scale=1e2,
+              dpdx_crit=1e3, dpdx_threshold_scale=1e2,
+              max_edge_dist=np.inf, remote_sigma_xx=0.0):
     self.nodes:list = nodes
-    self.K_f = K_f
-    self.t_b = t_b
-    self.t_d = t_d
-    self.K_crust = K_crust
-    self.G_crust = G_crust
-    self.r_hydr = r_hydr
-    self.mu0 = mu0
-    self.M_crust = K_crust + 4.0*G_crust/3.0
+    self.K_f_default = K_f_default
+    self.t_b_default = t_b_default
+    self.t_d_default = t_d_default
+    self.K_crust_default = K_crust_default
+    self.G_crust_default = G_crust_default
+    self.r_hydr_default = r_hydr_default
+    self.mu_default = mu_default
+
     self.Nr = Nr
+    self.p_crit = p_crit
+    self.p_threshold_scale = p_threshold_scale
     self.dpdx_crit = dpdx_crit
     self.dpdx_threshold_scale = dpdx_threshold_scale
     self.R_outer_ratio = R_outer_ratio
+
     self.max_edge_dist = max_edge_dist
+    self.remote_sigma_xx = remote_sigma_xx
+
+    self.M_crust_default = K_crust_default + 4.0*G_crust_default/3.0
     self.num_blocks = len(nodes)
     self.num_dof = self.num_blocks * self.block_size
-    self.remote_sigma_xx = remote_sigma_xx
+
     # Check implemented data schema for organizing field variables
     self.check_schema_validity()
     # Initialize nodes with linearization point, operators
     [self._init_node(node) for node in self.nodes]
 
     self.mat_props = dict(
-      t_b = t_b,
-      t_d = t_d,
-      K_crust = K_crust,
-      G_crust = G_crust,
-      K_f = K_f,
-      mu0 = mu0,
-      r_hydr = r_hydr,
+      t_b = t_b_default,
+      t_d = t_d_default,
+      K_crust = K_crust_default,
+      G_crust = G_crust_default,
+      K_f = K_f_default,
+      mu0 = mu_default,
+      r_hydr = r_hydr_default,
     )
 
     # Set initial condition with initial (absolute) mass
@@ -522,7 +555,7 @@ class GlobalSystemThreshold():
       node.k_mod = k_mod
 
   def _init_node(self, node, K_crust=None, G_crust=None, K_f=None,
-                 t_d=None, t_b=None) -> None:
+                 t_d=None, t_b=None, r_hydr=None, mu0=None) -> None:
     ''' Initializes node by allocating the linear elasticity affine mapping
     and recording the current m, R as the linearization point.
     
@@ -555,11 +588,14 @@ class GlobalSystemThreshold():
 
     # Read properties from args, else use global default
     node.Nr      = self.Nr
-    node.K_crust = self.K_crust if K_crust is None else K_crust
-    node.G_crust = self.G_crust if G_crust is None else G_crust
-    node.K_f     = self.K_f     if K_f is None else K_f
-    node.t_d     = self.t_d     if t_d is None else t_d
-    node.t_b     = self.t_b     if t_b is None else t_b 
+    node.K_crust = self.K_crust_default if K_crust is None else K_crust
+    node.G_crust = self.G_crust_default if G_crust is None else G_crust
+    node.K_f     = self.K_f_default     if K_f is None else K_f
+    node.t_d     = self.t_d_default     if t_d is None else t_d
+    node.t_b     = self.t_b_default     if t_b is None else t_b 
+    # Read edge properties TODO: how to determine edge property from node?
+    node.r_hydr  = self.r_hydr_default  if r_hydr is None else r_hydr 
+    node.mu0     = self.mu_default      if mu0 is None else mu0 
     # Compute dependent quantities
     node.M_crust = node.K_crust + (4.0 / 3.0) * node.G_crust
     
@@ -714,7 +750,7 @@ class GlobalSystemThreshold():
           threshold_factor = 1.0
 
         # Compute flow admittance ( (m/s) / Pa )
-        Y[i,j] = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / dist
+        Y[i,j] = threshold_factor * self.r_hydr_defualt * self.r_hydr_defualt / 16.0 / self.mu0 / dist
 
     return Y
 
@@ -830,12 +866,16 @@ class GlobalSystemThreshold():
           if p_node[i] > p_node[j]:
             rho = self.nodes[i].rhoref
             K_f = self.nodes[i].K_f
+            r_hydr = self.nodes[i].r_hydr
+            mu = self.nodes[i].mu0
           else:
             rho = self.nodes[j].rhoref
             K_f = self.nodes[j].K_f
+            r_hydr = self.nodes[j].r_hydr
+            mu = self.nodes[j].mu0
           # Compute flow admittance ( (m/s) / Pa )
           #   sign is determined automatically by multiplication with state vector q
-          Y = threshold_factor * self.r_hydr * self.r_hydr / 16.0 / self.mu0 / self.dists[i,j]
+          Y = threshold_factor * r_hydr * r_hydr / 16.0 / mu / self.dists[i,j]
           # Multiply upstream density and bulk modulus to units (mass areal flux)
           mflux = Y * rho * K_f
           if return_format == "tups":
@@ -1114,11 +1154,12 @@ class GlobalSystemThreshold():
     '''
     def f(t, q):
       f_inj = np.zeros((self.num_dof))
+      mu = self.nodes[0].mu0
       p_node = self.pressure(q)
       # Compute actual overpressure for node 0
       deltap = self.nodes[0].p_init + feed_overpressure - p_node[0]
       # Compute injection rate by flow rule
-      injection_rate = self.nodes[0].rhoref * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
+      injection_rate = self.nodes[0].rhoref * (deltap / (16.0 * mu)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
       f_inj[self.data_slice_global(0, "mass")] = injection_rate
       return f_inj
     return f
@@ -1145,7 +1186,7 @@ class GlobalSystemThreshold():
                              z_min=-5e6,
                              z_max=0.0,
                              mu_erupt= 1e5,
-                             r_conduit = 25, distr_method="linear"):
+                             r_conduit=25, distr_method="linear"):
     
     ''' Return a function that computes the eruption rate for an eruptible layer.
     The eruptible layer assigns an eruption pressure to a layer bounded by
@@ -1176,7 +1217,10 @@ class GlobalSystemThreshold():
       for i, (node_idx, z, p_erupt) in enumerate(i_z_p_nodes):
         deltap = (p_node[node_idx] - self.nodes[node_idx].p_init) - p_erupt
         if deltap > 0:
-          eruption_rate = self.rhoref * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+          # Compute eruption rate based on erupting node parameters and 
+          # specified r_conduit length scale
+          eruption_rate = self.nodes[node_idx].rhoref * (
+            deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
           # Set eruption rate in mass conservation equation
           f_erupt[self.data_slice_global(node_idx, "mass")] = -eruption_rate
       return f_erupt
@@ -1574,42 +1618,4 @@ class GlobalSystemThreshold():
 
 if __name__ == "__main__":
 
-  # Dev / debug script
-
-  for i in range(len(p_outs)):
-    plt.loglog(t_outs[i], p_outs[i][:,-1] / 1e6, '.-', label=f"${N_range[i]} \\times {N_range[i]}$")
-  plt.xlabel("Time (s)")
-  plt.ylabel("Pressure (MPa)")
-  plt.legend()
-  plt.title("Chamber #-1 (injection site)")
-
-  # Define vector of t points spanning both timescales
-  N_t = 100
-  t1 = 1e7
-  t2 = 1e8
-  t_vec = np.array([*np.linspace(0, t1, N_t+1), *np.linspace(t1, t2, N_t+1)[1:]])
-  t_d_range = np.geomspace(1e5, 1e9, 11)
-
-  t_outs = [None for _ in t_d_range]
-  q_outs = [None for _ in t_d_range]
-  gs_outs = [None for _ in t_d_range]
-
-  for i, t_d in enumerate(t_d_range):
-    t_outs[i], q_outs[i], gs_outs[i] = solve_network_N(4, total_vol, mass_inj, t_vec=t_vec, method=2,
-                                                      t_b=t_d, t_d=t_d, K_crust=10e9, G_crust=10e9, K_f=5e9,)
-    print(f"Solved network t_d = {t_d}.")
-
-  outputs = [post(*tup) for tup in zip (t_outs, q_outs, gs_outs)]
-  m_outs, p_outs, sigma_rr_outs, u_outs = zip(*outputs)
-
-  outputs_short = outputs[::2]
-  t_d_range_short = t_d_range[::2]
-
-  fig, ax = plt.subplots(1,len(outputs_short),figsize=(15,4.2))
-
-  for i in range(0, len(outputs_short)):
-    polys = ax[i].stackplot(t_outs[i][:len(t_outs[i])],
-                          m_outs[i][:len(t_outs[i])].T - gs_outs[i].m0)
-    ax[i].set_title(f"$t_d = ${t_d_range_short[i]:.2e}")
-  fig.tight_layout()
-  print("Excess mass distribution over shorter transfer timescale")
+  print("cnetwork.py is a tool file; import GlobalSystemThreshold to use.")
