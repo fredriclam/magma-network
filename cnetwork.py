@@ -113,14 +113,13 @@ def op_A(h, Nr, r_mesh):
   return A
 
 def prop_factory(t_b=1e11, t_d=5e10, K_crust=10e9, G_crust=10e9,
-                 K_f=10e9, rho0=2500, mu0=1e6, r_hydr=5):
+                 K_f=10e9, mu0=1e6, r_hydr=5):
   return dict(
     t_b = t_b,     # Set Maxwell times
     t_d = t_d,     # Set Maxwell times
     K_crust = K_crust,
     G_crust = G_crust,
     K_f = K_f,
-    rho0 = rho0,
     mu0 = mu0,      # Constant viscosity assumption
     r_hydr = r_hydr,     # Effective hydraulic radius
   )
@@ -130,7 +129,7 @@ class MagmaChamber(Node):
                x:float=np.nan, y:float=0.0, z:float=np.nan,
                p_setting:object=None, T_setting:object=None,
                V_setting:object=None,
-               c_v=1e3, K=10e9, v0=1/2.5e3, p0=25e6, g=10):
+               c_v=1e3, K=10e9, vref=1/2.5e3, pref=25e6, g=10):
     ''' Initializes a magma chamber from coordinates, pressure, temperature,
     and volume.
 
@@ -154,9 +153,9 @@ class MagmaChamber(Node):
     # Magma parameters
     self.c_v = c_v # Specific heat capacity (J/kg K)
     self.K = K
-    self.v0 = v0
-    self.rho0 = 1.0/v0
-    self.p0 = p0
+    self.vref = vref
+    self.rhoref = 1.0/vref
+    self.pref = pref
     self.g = g
 
     # Spatial settings
@@ -211,53 +210,53 @@ class MagmaChamber(Node):
 
     ''' Compute E, m '''
     # Compute mass from volume and specific volume v(p) via EOS
-    self.m = self.V / MagmaChamber.v_p(self.p_init, self.K, self.v0, self.p0)
+    self.m = self.V / MagmaChamber.v_p(self.p_init, self.K, self.vref, self.pref)
     # Compute energy via volume and volumetric energy (caloric equation)
     self.E = self.V * MagmaChamber.volenergy_pT(
-        self.p_init, self.T_init, self.K, self.v0, self.p0, self.c_v)
+        self.p_init, self.T_init, self.K, self.vref, self.pref, self.c_v)
 
   ''' Static equation of state (EOS) and caloric implementations
 
-     (p - p0) / K = - (v - v0) / v0
+     (p - pref) / K = - (v - vref) / vref
 
-  where K is the magma bulk modulus and (p0, v0) is a linearization point.
+  where K is the magma bulk modulus and (pref, vref) is a linearization point.
   Energy is defined as
 
-     E = m * c_v * T + 0.5 * (p - p0)^2 / K,
+     E = m * c_v * T + 0.5 * (p - pref)^2 / K,
 
   where c_v is a constant-volume heat capacity.
 
   '''
 
   @staticmethod
-  def v_p(p, K, v0, p0):
+  def v_p(p, K, vref, pref):
     ''' Specific volume as function of pressure from EOS
     '''
-    return v0 * (1 - (p - p0) / K)
+    return vref * (1 - (p - pref) / K)
 
   @staticmethod
-  def p_v(v, K, v0, p0):
+  def p_v(v, K, vref, pref):
     ''' Pressure as function of specific volume from EOS
     '''
-    return p0 - K * (v - v0) / v0
+    return pref - K * (v - vref) / vref
 
   @staticmethod
-  def strain_volenergy_p(p, K, v0, p0):
+  def strain_volenergy_p(p, K, vref, pref):
     ''' Strain energy in magma as function of pressure from EOS
     '''
-    return 0.5 * (p - p0)*(p - p0) / K
+    return 0.5 * (p - pref)*(p - pref) / K
 
   @staticmethod
-  def strain_volenergy_v(v, K, v0, p0):
+  def strain_volenergy_v(v, K, vref, pref):
     ''' Strain energy in magma as function of spec. vol. from EOS
     '''
-    return 0.5 * (1 - v/v0)*(1 - v/v0) * K
+    return 0.5 * (1 - v/vref)*(1 - v/vref) * K
 
   @staticmethod
-  def volenergy_pT(p, T, K, v0, p0, c_v):
+  def volenergy_pT(p, T, K, vref, pref, c_v):
     ''' Volumetric energy from p, T '''
-    e_mech = 0.5 * (p - p0)*(p - p0) / K
-    e_int  = c_v * T / MagmaChamber.v_p(p, K, v0, p0)
+    e_mech = 0.5 * (p - pref)*(p - pref) / K
+    e_int  = c_v * T / MagmaChamber.v_p(p, K, vref, pref)
     return e_mech + e_int
 
   ''' Dependent quantities as object properties '''
@@ -282,12 +281,12 @@ class MagmaChamber(Node):
   @property
   def p(self):
     ''' Returns pressure through EOS and parameters in self. '''
-    return MagmaChamber.p_v(self.v, self.K, self.v0, self.p0)
+    return MagmaChamber.p_v(self.v, self.K, self.vref, self.pref)
 
   @property
   def strain_volenergy(self):
     ''' Strain energy per volume and parameters in self. '''
-    return MagmaChamber.strain_volenergy_v(self.V/self.m, self.K, self.v0, self.p0)
+    return MagmaChamber.strain_volenergy_v(self.V/self.m, self.K, self.vref, self.pref)
 
   @property
   def internal_volenergy(self):
@@ -391,12 +390,11 @@ class GlobalSystemThreshold():
                       + "state vector for a single chamber may be invalid.")
 
   def __init__(self, nodes:list, t_b, t_d, K_crust, G_crust, r_hydr, mu0,
-               rho0=2500, K_f=10e9, Nr=50,
+               K_f=10e9, Nr=50,
                p_crit=1e3, p_threshold_scale=1e2,
                dpdx_crit=1e3, dpdx_threshold_scale=1e2, R_outer_ratio=20,
                max_edge_dist=np.inf, remote_sigma_xx=0.0):
     self.nodes:list = nodes
-    self.rho0 = rho0
     self.K_f = K_f
     self.t_b = t_b
     self.t_d = t_d
@@ -424,7 +422,6 @@ class GlobalSystemThreshold():
       K_crust = K_crust,
       G_crust = G_crust,
       K_f = K_f,
-      rho0 = rho0,
       mu0 = mu0,
       r_hydr = r_hydr,
     )
@@ -767,7 +764,7 @@ class GlobalSystemThreshold():
       Here we estimate
       p_i - p_j = - 3 * K_f (u_ri / R_i - u_rj / R_j) + K_f * (m_i/m_0i - m_j/m_0j)
       and thus
-      \dot{m}_{ij} = Adj_{ij} * hydr_cond * rho0 * K_f * (
+      \dot{m}_{ij} = Adj_{ij} * hydr_cond * rhoref * K_f * (
         - 3 * (u_ri / R_i - u_rj / R_j) + (m_i/m_0i - m_j/m_0j)
       )
       where Adj is the adjacency matrix. Here the hydraulic conductivity has units of
@@ -803,7 +800,7 @@ class GlobalSystemThreshold():
         # Compute average pressure gradient between self.nodes[i] and self.nodes[j]
         dpdx = (p_node[i] - p_node[j]) / self.dists[i,j]
         # Hydrostatic pressure difference divided by distance
-        dpdx_hydro = 0.5 * (self.nodes[i].rho0 + self.nodes[j].rho0) * g * (
+        dpdx_hydro = 0.5 * (self.nodes[i].rhoref + self.nodes[j].rhoref) * g * (
           (self.nodes[i].z - self.nodes[j].z) / self.dists[i,j])
         # Account for hydrostatic pressure gradient
         dpdx += dpdx_hydro
@@ -831,10 +828,10 @@ class GlobalSystemThreshold():
         if threshold_factor > 1e-15:
           # Set upstream properties for flow
           if p_node[i] > p_node[j]:
-            rho = self.nodes[i].rho0
+            rho = self.nodes[i].rhoref
             K_f = self.nodes[i].K_f
           else:
-            rho = self.nodes[j].rho0
+            rho = self.nodes[j].rhoref
             K_f = self.nodes[j].K_f
           # Compute flow admittance ( (m/s) / Pa )
           #   sign is determined automatically by multiplication with state vector q
@@ -871,7 +868,7 @@ class GlobalSystemThreshold():
       return mass_rates
 
   def pressure(self, q):
-    ''' Compute vector of pressures, indexed by chamber number '''
+    ''' Compute vector of pressures, indexed by chamber number. '''
     p = np.zeros((self.num_blocks, 1))
     # Extract masses, vectorized
     m = q[self.mass_indices]
@@ -884,7 +881,7 @@ class GlobalSystemThreshold():
       dp_u = -3 * node.K_f * wall_displacement[i] / node.R0
       # Pressure increase contribution due to added mass (m0 may be node-dependent)
       dp_m = node.K_f * ((m[i] - node.m0) / node.m0)
-      p[i] = node.p0 + dp_u + dp_m
+      p[i] = node.p_init + dp_u + dp_m
     return p
 
   def u(self, q):
@@ -1055,7 +1052,7 @@ class GlobalSystemThreshold():
     for j, node in enumerate(self.nodes):
       dp_u = -3 * node.K_f * u[:,j] / node.R0
       dp_m = node.K_f * ((m[:,j] - node.m0) / node.m0)
-      p[:,j] = node.p0 + dp_u + dp_m
+      p[:,j] = node.p_init + dp_u + dp_m
 
     return m, p, u
 
@@ -1111,13 +1108,17 @@ class GlobalSystemThreshold():
     return f
 
   def create_single_pressure_injection_source(self, feed_overpressure):
+    ''' Returns callable function representing mass injection at node 0
+    due to a constant pressure source with overpressure relative to the
+    initial state of node 0.
+    '''
     def f(t, q):
       f_inj = np.zeros((self.num_dof))
       p_node = self.pressure(q)
-      # Compute overpressure for node 0
-      deltap = feed_overpressure - (p_node[0] - self.nodes[0].p0)
+      # Compute actual overpressure for node 0
+      deltap = self.nodes[0].p_init + feed_overpressure - p_node[0]
       # Compute injection rate by flow rule
-      injection_rate = self.nodes[0].rho0 * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
+      injection_rate = self.nodes[0].rhoref * (deltap / (16.0 * self.mu0)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
       f_inj[self.data_slice_global(0, "mass")] = injection_rate
       return f_inj
     return f
@@ -1128,9 +1129,9 @@ class GlobalSystemThreshold():
       p_node = self.pressure(q)
       f_erupt = np.zeros((self.num_dof))
       # Compute pressure in excess of critical eruption overpressure
-      deltap = (p_node[-1] - self.nodes[-1].p0) - p_erupt
+      deltap = (p_node[-1] - self.nodes[-1].p_init) - p_erupt
       if deltap > 0:
-        eruption_rate = self.rho0 * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+        eruption_rate = self.nodes[-1].rhoref * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
         # Set eruption rate in mass conservation equation
         f_erupt[self.data_slice_global(-1, "mass")] = -eruption_rate
       return f_erupt
@@ -1173,9 +1174,9 @@ class GlobalSystemThreshold():
       f_erupt = np.zeros((self.num_dof))
       # Compute pressure in excess of critical eruption overpressure
       for i, (node_idx, z, p_erupt) in enumerate(i_z_p_nodes):
-        deltap = (p_node[node_idx] - self.nodes[node_idx].p0) - p_erupt
+        deltap = (p_node[node_idx] - self.nodes[node_idx].p_init) - p_erupt
         if deltap > 0:
-          eruption_rate = self.rho0 * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+          eruption_rate = self.rhoref * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
           # Set eruption rate in mass conservation equation
           f_erupt[self.data_slice_global(node_idx, "mass")] = -eruption_rate
       return f_erupt
@@ -1595,7 +1596,7 @@ if __name__ == "__main__":
 
   for i, t_d in enumerate(t_d_range):
     t_outs[i], q_outs[i], gs_outs[i] = solve_network_N(4, total_vol, mass_inj, t_vec=t_vec, method=2,
-                                                      t_b=t_d, t_d=t_d, K_crust=10e9, G_crust=10e9, K_f=5e9, rho0=2500)
+                                                      t_b=t_d, t_d=t_d, K_crust=10e9, G_crust=10e9, K_f=5e9,)
     print(f"Solved network t_d = {t_d}.")
 
   outputs = [post(*tup) for tup in zip (t_outs, q_outs, gs_outs)]
