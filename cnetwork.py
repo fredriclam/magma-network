@@ -1219,8 +1219,12 @@ class GlobalSystemThreshold():
       p_node = self.pressure(q)
       # Allocate
       f_erupt = np.zeros((self.num_dof))
+
       # Compute pressure in excess of critical eruption overpressure
       for i, (node_idx, z, p_erupt) in enumerate(i_z_p_nodes):
+        # Compute hydrostatic overpressure needed to reach surface
+        # p_hydrostatic = g * self.nodes[node_idx].rhoref * (-self.nodes[node_idx].z)
+        # Compute total overpressure with hydrostatic component
         deltap = (p_node[node_idx] - self.nodes[node_idx].p_init) - p_erupt
         if deltap > 0:
           # Compute eruption rate based on erupting node parameters and 
@@ -1231,7 +1235,7 @@ class GlobalSystemThreshold():
           f_erupt[self.data_slice_global(node_idx, "mass")] = -eruption_rate
       return f_erupt
     
-    f.i_z_p_nodes = i_z_p_nodes    
+    f.i_z_p_nodes = i_z_p_nodes
     return f
 
   def simulation(self, q0, t_vec, f_inject:callable, f_erupt:callable, method_order=1,
@@ -1301,23 +1305,29 @@ class GlobalSystemThreshold():
         # Evaluate initial eruption rate
         vec_f_erupt = f_erupt(t, q)
 
-        # Eruption rate limiter for first-order explicit Euler
-        # Compute elastic equilibrium for top node
-        q_loc = q[(self.num_blocks-1) * self.block_size:
-                  self.num_blocks * self.block_size]
-        u_eq = (self.nodes[-1].H_mod @ q_loc + self.nodes[-1].k_mod).squeeze()
-        m_eq = self.nodes[-1].m0 * (1 + 3 * u_eq[0] / self.nodes[-1].R0)
+        # Identify erupting nodes
+        indices_erupting_nodes = np.arange(len(self.mass_indices))[
+          np.abs(vec_f_erupt[self.mass_indices]) > 0]
+        for i_erupt in indices_erupting_nodes:
+          # Eruption rate limiter for first-order explicit Euler
+          # Compute elastic equilibrium for erupting nodes
+          q_loc = q[(self.num_blocks-1) * self.block_size:
+                    self.num_blocks * self.block_size]
+          u_eq = (self.nodes[i_erupt].H_mod @ q_loc + self.nodes[i_erupt].k_mod).squeeze()
+          m_eq = self.nodes[i_erupt].m0 * (1 + 3 * u_eq[0] / self.nodes[i_erupt].R0)
 
-        if limit_eruption_rate_by_p:
-          # Max eruption rate down to p0
-          max_eruption_rate = np.abs(float(q[self.data_slice_global(-1, "mass")] - m_eq) / dt)
-        else:
-          # Max eruption rate down to m0
-          max_eruption_rate = np.abs(float(q[self.data_slice_global(-1, "mass")] - self.nodes[-1].m0) / dt)
-
-        vec_f_erupt = np.clip(vec_f_erupt, -max_eruption_rate, max_eruption_rate)
-        # Integrate erupted mass
-        m_erupted += -float(vec_f_erupt[self.data_slice_global(-1, "mass")]) * dt
+          if limit_eruption_rate_by_p:
+            # Max eruption rate down to p0
+            max_eruption_rate = np.abs(float(q[self.data_slice_global(i_erupt, "mass")] - m_eq) / dt)
+          else:
+            # Max eruption rate down to m0
+            max_eruption_rate = np.abs(float(q[self.data_slice_global(i_erupt, "mass")] - self.nodes[i_erupt].m0) / dt)
+          # Limit dm/dt for erupting node with index i_erupt
+          vec_f_erupt[self.mass_indices[i_erupt]] = np.clip(
+            vec_f_erupt[self.mass_indices[i_erupt]] , -max_eruption_rate, max_eruption_rate)
+          # Integrate total erupted mass
+          m_erupted += -float(vec_f_erupt[self.data_slice_global(i_erupt, "mass")]) * dt
+        
         # Vector shape cleanup
         f_tot = np.reshape(
           f.ravel() + f_inject(t, q).ravel() + vec_f_erupt.ravel(),
