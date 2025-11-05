@@ -928,6 +928,7 @@ class GlobalSystemThreshold():
     ''' Compute vector of displacements, indexed by chamber number.
     Use this only for matrix valued q.
     '''
+    raise DeprecationWarning("GlobalSystemThreshold.u is deprecated. Use GlobalSystemThreshold.compute_m_p_u instead.")
     u = np.zeros((self.num_blocks, self.Nr))
     for i, node in enumerate(self.nodes):
       u[i,:] = (node.H @ q[i*self.block_size:(i+1)*self.block_size] + node.k).squeeze()
