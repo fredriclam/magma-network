@@ -14,7 +14,7 @@ class Node():
   def __init__(self):
     pass
 
-def p_lithostatic(z, p_surf=1e5, z_surf=0, rho_crust=2.8e3, g=10):
+def p_lithostatic(z, p_surf=1e5, z_surf=0, rho_crust=2.5e3, g=10):
   ''' Lithostatic pressure as function of depth z. '''
   return p_surf - rho_crust * g * (z - z_surf)
 
@@ -890,7 +890,7 @@ class GlobalSystemThreshold():
               Y_matrix[j,i] = -Y
           else:
             # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M
-            mass_rates[:,i] = mflux * (
+            mass_rates[:,i] += mflux * (
               self.M_stencils[(i,j,)] @ q)[self.mass_indices].squeeze()
       
       # if not (return_format == "tups" or return_format == "M"):
