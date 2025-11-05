@@ -778,6 +778,9 @@ class GlobalSystemThreshold():
       * None: default return (mass_rates matrix)
       * "M": global mass transfer matrix, such that M@q is the mass_rates matrix
       * "tups": mass transfer rates in tuple format (i, j, mass rate)
+      * "Y": flow conductivity ((m/s) / Pa) matrix, with i -> j appearing in
+        the upper triangular part, and j -> appearing in the lower part. Time-
+        dependent.
     
     Parameter threshold sets the physical threshold:
       * "gradient" (default): Threshold is set based on gradient |p_i - p_j| / dz
@@ -822,7 +825,9 @@ class GlobalSystemThreshold():
       Y_matrix = np.zeros((num_blocks, num_blocks))
     elif return_format is None:
       # Allocate mass rates from j to i
-      mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
+      # Sparse matrix here has difficulties with operator+=
+      # mass_rates = scipy.sparse.lil_matrix((self.num_blocks, self.num_blocks))
+      mass_rates = np.zeros((self.num_blocks, self.num_blocks))
     else:
       raise ValueError(f"Invalid return_format passed to mass_rates. ('tups'|'M'|'Y'|None)")
     
@@ -890,7 +895,7 @@ class GlobalSystemThreshold():
               Y_matrix[j,i] = -Y
           else:
             # Multiply mass rate coefficient (kg / s) by dimensionless flow matrix M
-            mass_rates[:,i] += mflux * (
+            mass_rates[:,i] -= mflux * (
               self.M_stencils[(i,j,)] @ q)[self.mass_indices].squeeze()
       
       # if not (return_format == "tups" or return_format == "M"):
@@ -1376,7 +1381,7 @@ class GlobalSystemThreshold():
       # Extract global state vector
       q = q_out[time_idx,:]
       # Compute strictly lower triangular mass transfer matrix
-      M = self.mass_rates(q).tocoo()
+      M = scipy.sparse.coo_matrix(self.mass_rates(q))
 
       # For each positive mass rate along edge
       for i, j, mdot in zip(M.row, M.col, M.data):
