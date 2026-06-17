@@ -147,7 +147,7 @@ class MagmaChamber(Node):
                x:float=np.nan, y:float=0.0, z:float=np.nan,
                p_setting:object=None, T_setting:object=None,
                V_setting:object=None,
-               c_v=1e3, K=10e9, vref=1/2.5e3, pref=25e6, g=10):
+               c_v=1e3, K=10e9, vref=1/2.5e3, pref=25e6, g=10,):
     ''' Initializes a magma chamber from coordinates, pressure, temperature,
     and volume.
 
@@ -420,7 +420,10 @@ class GlobalSystemThreshold():
               R_outer_ratio=20,
               p_crit=1e3, p_threshold_scale=1e2,
               dpdx_crit=1e3, dpdx_threshold_scale=1e2,
-              max_edge_dist=np.inf, remote_sigma_xx=0.0):
+              max_edge_dist=np.inf, remote_sigma_xx=0.0,
+              always_max_eruption_rate:bool=False,
+              residual_overpressure:float=0.0
+              ):
     self.nodes:list = nodes
     self.K_f_default = K_f_default
     self.t_b_default = t_b_default
@@ -439,6 +442,9 @@ class GlobalSystemThreshold():
 
     self.max_edge_dist = max_edge_dist
     self.remote_sigma_xx = remote_sigma_xx
+
+    self.always_max_eruption_rate = always_max_eruption_rate
+    self.residual_overpressure = residual_overpressure
 
     self.M_crust_default = K_crust_default + 4.0*G_crust_default/3.0
     self.num_blocks = len(nodes)
@@ -536,6 +542,9 @@ class GlobalSystemThreshold():
     equilibrium, without change to the viscous displacement for the given node.
     The equilibrium displacement field is given by
       u_eq = H_mod @ q_loc + k_mod.squeeze()
+    
+    See also compute_m_eq.
+      
     '''
     for i, node in enumerate(self.nodes):
       # Outer product matrix representing effect of mass on bdry displacement
@@ -545,17 +554,89 @@ class GlobalSystemThreshold():
       H_mod = scipy.sparse.linalg.spsolve_triangular(
         scipy.sparse.eye(Nr, Nr) - outer, node.H.todense(), lower=True)
       # Compute modified k
-      k_mod =  scipy.sparse.linalg.spsolve_triangular(
+      node.k_mod =  scipy.sparse.linalg.spsolve_triangular(
         scipy.sparse.eye(Nr, Nr) - outer, node.k, lower=True)
-      # Move dependence on mass in input q to dependence on m0
-      k_mod += H_mod[:, self.data_slice["mass"]] * node.m0
-      H_mod[:, self.data_slice["mass"]] = 0
-      # Attach H_mod, k_mod to node
-      node.H_mod = scipy.sparse.csr_matrix(H_mod)
-      node.k_mod = k_mod
 
-  def _init_node(self, node, K_crust=None, G_crust=None, K_f=None,
-                 t_d=None, t_b=None, r_hydr=None, mu0=None) -> None:
+      # node.k_mod += H_mod[:, self.data_slice["mass"]] * node.m0 # Legacy
+
+      # Keep size of H by zeroing mass column
+      node.h_m_mod = H_mod[:, self.data_slice["mass"]].copy()
+      H_mod[:, self.data_slice["mass"]] = 0
+      # Attach H_mod to node
+      node.H_mod = scipy.sparse.csr_matrix(H_mod)
+
+  def compute_m_u_eq(self, q, i_erupt, residual_overpressure):
+    ''' Compute equilibrium mass & u using precomputed linear operator. The
+    equilibrium is assumed to be at some residual overpressure, which may be
+    positive, zero, or negative. If the equilibrium is achieved with the chamber
+    returning to its initial pressure, set residual_overpressure to zero.
+
+    u_eq = H_mod @ q_loc + k_mod.squeeze()
+
+    The derivation is as follows. The vector displacement field u(r) is given by
+    the vector equation
+
+      u = H @ q + k
+
+    where H and k are precomputed matrices local to one node, and q is the
+    state vector restricted to the indices of this node (this is not the global
+    q vector--only the portion for this node).
+    
+    Now we split off the mass variables from the product H @ q and use subscript
+    m as the indices corresponding to mass, use Hr to denote H with the mass
+    column removed, and qr to denote q with the mass entry removed. Then
+
+      u = h_m * m + Hr @ qr + k
+
+    To find the equilibrium mass, we allow m to vary, but freeze qr. We bring in
+    the EOS:
+
+      m_eq / m_0 = 1 + 3 * u_eq[0] / R + (p_eq - pref) / K_f,
+
+    where u_eq[0] is the 0th element of u_eq (i.e. displacement at the chamber
+    wall). Plugging this into the equation for u,
+
+      u_eq = m_0 * (1 + (p_eq - pref) / K_f) * h_m
+             + m_0 * (3 * u_eq[0] / R) * h_m
+             + Hr @ qr + k
+
+    or, rewriting the system,
+
+      (I - (3*m_0/R) * h_m @ e0.T ) u_eq = Hr @ qr
+                               + (k + m_0 * (1 + (p_eq - pref) / K_f) * h_m)
+
+    By inverting the left hand side matrix, we get the vector u_eq as an
+    affine map from q. This is precomputed as self.H_mod and self.k_mod:
+     
+      u_eq = inv(I - (3*m_0/R) * h_m @ e0.T ) @ H @ qr
+           + inv(I - (3*m_0/R) * h_m @ e0.T ) @ k
+           + inv(I - (3*m_0/R) * h_m @ e0.T ) @ h_m * 
+             (m_0 * (1 + (p_eq - pref) / K_f))
+           = H_mod @ q
+            + k_mod
+            + (m_0 * (1 + (p_eq - pref) / K_f)) * h_m_mod
+    
+    Note H_mod has a zero column corresponding to the mass index so that
+    it has the right shape to multiply q.
+
+    '''
+
+    node = self.nodes[i_erupt]
+    q_loc = q[i_erupt*self.block_size:(i_erupt+1)*self.block_size].squeeze()
+
+    
+# u_eq = (self.nodes[i_erupt].H_mod @ q_loc + self.nodes[i_erupt].k_mod).squeeze() # Legacy
+          # m_eq = self.nodes[i_erupt].m0 * (1 + 3 * u_eq[0] / self.nodes[i_erupt].R0)
+
+    u_eq = (node.H_mod @ q_loc
+            + node.k_mod.squeeze()
+            + np.array(node.m0 * (1 + residual_overpressure / node.K_f)
+              * node.h_m_mod).squeeze())
+    m_eq = node.m0 * (1 + 3 * u_eq[0] / node.R0)
+
+    return m_eq, u_eq
+
+  def _init_node(self, node) -> None:
     ''' Initializes node by allocating the linear elasticity affine mapping
     and recording the current m, R as the linearization point.
     
@@ -588,21 +669,21 @@ class GlobalSystemThreshold():
 
     # Read properties from args, else use global default
     node.Nr      = self.Nr
-    node.K_crust = self.K_crust_default if K_crust is None else K_crust
-    node.G_crust = self.G_crust_default if G_crust is None else G_crust
-    node.K_f     = self.K_f_default     if K_f is None else K_f
-    node.t_d     = self.t_d_default     if t_d is None else t_d
-    node.t_b     = self.t_b_default     if t_b is None else t_b 
-    # Read edge properties TODO: how to determine edge property from node?
-    node.r_hydr  = self.r_hydr_default  if r_hydr is None else r_hydr 
-    node.mu0     = self.mu_default      if mu0 is None else mu0 
+    node.K_crust = getattr(node, "K_crust", self.K_crust_default)
+    node.G_crust = getattr(node, "G_crust", self.G_crust_default)
+    node.K_f     = getattr(node, "K_f", self.K_f_default)
+    node.t_d     = getattr(node, "t_d", self.t_d_default)
+    node.t_b     = getattr(node, "t_b", self.t_b_default)
+    # Read edge properties from node (assume upstream node properties apply in edge)
+    node.r_hydr  = getattr(node, "r_hydr", self.r_hydr_default)
+    node.mu0     = getattr(node, "mu0", self.mu_default)
     # Compute dependent quantities
     node.M_crust = node.K_crust + (4.0 / 3.0) * node.G_crust
     
-    # Unpack self properties
-    Nr, K_crust, G_crust, M_crust, K_f, t_d, t_b = \
-      node.Nr, node.K_crust, node.G_crust, node.M_crust, node.K_f, node.t_d, node.t_b
+    # Unpack global grid node count (need consistency between all nodes)
+    Nr = self.Nr
 
+    # Set up initial mass, radius
     m0 = node.m
     R0 = (node.V / (4*np.pi/3))**(1.0/3.0)
     # Set up mesh
@@ -629,9 +710,10 @@ class GlobalSystemThreshold():
     # Construct elastic portion of static equilibrium equation
     L_u[:, 0:Nr] = A
     # Construct mapping of γ_drr to term in static equilibrium equation
-    L_u[:, Nr:2*Nr] = 2 * (G_crust/M_crust) * D + 6 * (G_crust/M_crust) * diag_inv_r
+    L_u[:, Nr:2*Nr] = 2 * (node.G_crust/node.M_crust) * D \
+                      + 6 * (node.G_crust/node.M_crust) * diag_inv_r
     # Construct mapping of γ_kk to term in static equilibrium equation
-    L_u[:, 2*Nr:3*Nr] = (K_crust/M_crust) * D
+    L_u[:, 2*Nr:3*Nr] = (node.K_crust/node.M_crust) * D
 
     ''' Set traction boundary condition at r = R0
       \sigma_{rr} = -(p - p_0)
@@ -643,17 +725,17 @@ class GlobalSystemThreshold():
     L_u[0, :] = 0.0
     L_u[0, 0] += -1.0 / dx
     L_u[0, 1] += 1.0 / dx
-    L_u[0, 0] += (2*K_crust - 4*G_crust/3) / M_crust/ R0
+    L_u[0, 0] += (2*node.K_crust - 4*node.G_crust/3) / node.M_crust/ R0
     # Add r = R boundary dependence on γ_drr
-    L_u[0, Nr] = -2 * G_crust / M_crust
+    L_u[0, Nr] = -2 * node.G_crust / node.M_crust
     # Add r = R boundary dependence on γ_kk
-    L_u[0, 2*Nr] = -K_crust / M_crust
+    L_u[0, 2*Nr] = -node.K_crust / node.M_crust
     # Add r = R boundary dependence on boundary pressure, linearly dependent on u, m
-    L_u[0, 0] += - 3 * K_f / M_crust / R0
-    L_u[0, 3*Nr] += K_f / m0 / M_crust
+    L_u[0, 0] += - 3 * node.K_f / node.M_crust / R0
+    L_u[0, 3*Nr] += node.K_f / m0 / node.M_crust
     # Add RHS loading due to traction boundary condition
     f_u = np.zeros((Nr, 1))
-    f_u[0] += K_f / M_crust
+    f_u[0] += node.K_f / node.M_crust
     # Save RHS as sparse vector
     f_u = scipy.sparse.csc_matrix(f_u)
 
@@ -1311,10 +1393,10 @@ class GlobalSystemThreshold():
         for i_erupt in indices_erupting_nodes:
           # Eruption rate limiter for first-order explicit Euler
           # Compute elastic equilibrium for erupting nodes
-          q_loc = q[(self.num_blocks-1) * self.block_size:
-                    self.num_blocks * self.block_size]
-          u_eq = (self.nodes[i_erupt].H_mod @ q_loc + self.nodes[i_erupt].k_mod).squeeze()
-          m_eq = self.nodes[i_erupt].m0 * (1 + 3 * u_eq[0] / self.nodes[i_erupt].R0)
+          m_eq, u_eq = self.compute_m_u_eq(q, i_erupt, self.residual_overpressure)
+
+          # u_eq = (self.nodes[i_erupt].H_mod @ q_loc + self.nodes[i_erupt].k_mod).squeeze() # Legacy
+          # m_eq = self.nodes[i_erupt].m0 * (1 + 3 * u_eq[0] / self.nodes[i_erupt].R0)
 
           if limit_eruption_rate_by_p:
             # Max eruption rate down to p0
@@ -1322,12 +1404,16 @@ class GlobalSystemThreshold():
           else:
             # Max eruption rate down to m0
             max_eruption_rate = np.abs(float(q[self.data_slice_global(i_erupt, "mass")] - self.nodes[i_erupt].m0) / dt)
-          # Limit dm/dt for erupting node with index i_erupt
-          vec_f_erupt[self.mass_indices[i_erupt]] = np.clip(
-            vec_f_erupt[self.mass_indices[i_erupt]] , -max_eruption_rate, max_eruption_rate)
+          if self.always_max_eruption_rate:
+              # Limit dm/dt for erupting node with index i_erupt
+            vec_f_erupt[self.mass_indices[i_erupt]] = -max_eruption_rate
+          else:
+            # Limit dm/dt for erupting node with index i_erupt
+            vec_f_erupt[self.mass_indices[i_erupt]] = np.clip(
+              vec_f_erupt[self.mass_indices[i_erupt]] , -max_eruption_rate, max_eruption_rate)
           # Integrate total erupted mass
           m_erupted += -float(vec_f_erupt[self.data_slice_global(i_erupt, "mass")]) * dt
-        
+
         # Vector shape cleanup
         f_tot = np.reshape(
           f.ravel() + f_inject(t, q).ravel() + vec_f_erupt.ravel(),
@@ -1345,16 +1431,25 @@ class GlobalSystemThreshold():
           q = np.reshape(q, (self.num_dof, 1))
         else:
           # Compute tuples (i, j, mass_rate_scaling)
-          mass_transfer_tuples = self.mass_rates(q, return_format="tups")
-          U = np.zeros((self.num_dof, len(mass_transfer_tuples)))
-          V = np.zeros((len(mass_transfer_tuples), self.num_dof))
-          for edge_idx, (i, j, mdot_scaling) in enumerate(mass_transfer_tuples):
-            U[self.data_slice_global(i, "mass"), edge_idx] = 1.0
-            U[self.data_slice_global(j, "mass"), edge_idx] = -1.0
-            V[edge_idx, :] = dt * mdot_scaling * self.M_vecs[(i,j)]
-          q_lr = low_rank_update(RHS, static_inv, U, V)
-          # Reshape q
-          q_lr = np.reshape(q_lr, (self.num_dof, 1))
+          try:
+            mass_transfer_tuples = self.mass_rates(q, return_format="tups")
+            U = np.zeros((self.num_dof, len(mass_transfer_tuples)))
+            V = np.zeros((len(mass_transfer_tuples), self.num_dof))
+            for edge_idx, (i, j, mdot_scaling) in enumerate(mass_transfer_tuples):
+              U[self.data_slice_global(i, "mass"), edge_idx] = 1.0
+              U[self.data_slice_global(j, "mass"), edge_idx] = -1.0
+              V[edge_idx, :] = dt * mdot_scaling * self.M_vecs[(i,j)]
+            q_lr = low_rank_update(RHS, static_inv, U, V)
+            # Reshape q
+            q_lr = np.reshape(q_lr, (self.num_dof, 1))
+          except Exception as e:
+            # Cache data before exiting
+            self._mass_transfer_tuples = mass_transfer_tuples
+            self._RHS = RHS
+            self._q = q
+            self._q_out = q_out
+            self._t = t
+            raise Exception from e
 
           if check_residual:
             # Construct LHS matrix for backward Euler
@@ -1575,10 +1670,60 @@ class GlobalSystemThreshold():
 
     return node_location, node_z
 
+  def residence_time_count(self, node_location, N_nodes):
+    ''' Count number of particles in each chamber from output of
+    residence_time_sim.
+    
+    Transforms input node_location of shape (N_t, N_particles)
+    to output of shape (N_t, N_chamber) and output of shape
+    (N_chamber, N_chamber) representing the number of times each edge was
+    used by a simulated particle.
+    '''
+
+    N_nodes = len(self.nodes)
+
+    counts_by_chamber = np.zeros((node_location.shape[0], N_nodes,))
+
+    for i_t in range(node_location.shape[0]):
+      # At fixed time index, count number of simulated particles in each chamber
+      unique, counts = np.unique(node_location[i_t,:], return_counts=True)
+      # Update count
+      counts_by_chamber[i_t, unique] = counts
+
+    # Adjacency matrix with edge weights equal to number of simulated particles
+    # that used that edge
+    edges_used = np.zeros((N_nodes, N_nodes))
+    # Particles that reach last node indexed N_nodes-1
+    particles_top = node_location[:,node_location[-1,:] == N_nodes-1]
+    for i, particle_history in enumerate(range(particles_top.shape[1])):
+      nodes_visited = np.unique(particles_top[:,i])
+      for j in range(len(nodes_visited)-1):
+        edges_used[nodes_visited[j], nodes_visited[j+1]] += 1
+
+    return counts_by_chamber, edges_used
+
+  def residence_time_pressure(self, node_location, p, ):
+    ''' Computes the pressure history of particles that made it to the top.
+    Arg node_location is produced from residence_time_sim. Only particles
+    that reach the top are counted.
+    '''
+
+    N_nodes = len(self.nodes)
+    particles_top = node_location[:,node_location[-1,:] == N_nodes-1]
+
+    particle_history = np.zeros_like(particles_top, dtype=float)
+    for i in range(particles_top.shape[0]):
+      # Compute particle pressure at fixed time index
+      particle_history[i,:] = p[i, particles_top[i,:]]
+
+    return particle_history
+
   def compute_effective_connectivity(self, t_vec, q_out, window_nodes_vec=None):
-    ''' Compute effective connectivity at several averaging timescales
+    ''' Compute effective (scalar) connectivity at several averaging timescales
     Returns list of tuples [(n, dt_window, t_window_center, effective_conductivity)]
     If windows_nodes_vec is not provided, selects some windows of size ~4^n.
+
+    effective_conductivity is a time series corresponding to times t_window_center.
     '''
 
     if window_nodes_vec is None:
@@ -1630,6 +1775,21 @@ class GlobalSystemThreshold():
       all_effective_conductivities.append((n, dt_window, t_avg_range, effective_cond))
 
     return all_effective_conductivities
+
+  def compute_time_averaged_connectivity_matrix(self, t_vec, q, averaged=True,
+                                                threshold="gradient"):
+    ''' Computes time-averaged connectivity matrix Y.
+    Alternatively, if `averaged` is False, returns the list of matrices Y at
+    each time in vector t.
+     '''
+    
+    Y = np.stack([self.mass_rates(q[i,:], return_format="Y", threshold=threshold)
+                   for i, t in enumerate(t_vec)], axis=0)
+
+    if averaged:
+      return Y.mean(axis=0)
+    else:
+      return Y
 
 
 if __name__ == "__main__":
