@@ -765,11 +765,13 @@ class GlobalSystemThreshold():
     # Assemble dependence of viscous strain evolution on displacement u (through elastic strain)
     G = scipy.sparse.lil_matrix((block_size, Nr))
     G[0:Nr, 0:Nr] = -1.0 / node.t_d * op_E_drr(dx, Nr, r_mesh)
-    G[Nr:2*Nr, 0:Nr] = -1.0 / node.t_b * op_E_kk(dx, Nr, r_mesh)
+    if node.t_b != np.inf:
+      G[Nr:2*Nr, 0:Nr] = -1.0 / node.t_b * op_E_kk(dx, Nr, r_mesh)
     # Compute matrix L
     node.L = scipy.sparse.lil_matrix((block_size, block_size))
     node.L[np.arange(0,Nr), np.arange(0,Nr)] = (1 / node.t_d)
-    node.L[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / node.t_b)
+    if node.t_b != np.inf:
+      node.L[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / node.t_b)
     # Add dependence on u through Schur complement term
     node.L += G @ node.H
 
