@@ -348,6 +348,11 @@ class GlobalSystemThreshold():
   ''' Global coupled system of chambers with methods for manipulating the network.
 
   Heterogeneous properties of the chamber network are accepted.
+
+  Parameter "threshold" sets the physical threshold:
+    * "gradient" (default): Threshold is set based on gradient |p_i - p_j| / dz
+    * "absdiff": Threshold is set based on absolute pressure difference |p_i - p_j|
+
   '''
 
   # Define schema for data shape
@@ -413,6 +418,8 @@ class GlobalSystemThreshold():
               mu_default=1e6,
               t_b_default=1e11,
               t_d_default=5e10,
+              t_d_far=None,
+              t_d_mode="default",
               K_crust_default=10e9,
               G_crust_default=10e9,
               K_f_default=10e9,
@@ -422,12 +429,19 @@ class GlobalSystemThreshold():
               dpdx_crit=1e3, dpdx_threshold_scale=1e2,
               max_edge_dist=np.inf, remote_sigma_xx=0.0,
               always_max_eruption_rate:bool=False,
-              residual_overpressure:float=0.0
+              residual_overpressure:float=0.0,
+              is_crust_bulk_viscous:bool=True,
+              threshold="default",
               ):
     self.nodes:list = nodes
     self.K_f_default = K_f_default
     self.t_b_default = t_b_default
     self.t_d_default = t_d_default
+    if t_d_far is None: # TODO: this needs to work with depth-dependent viscosity
+      self.t_d_far_default = t_d_default
+    else:
+      self.t_d_far_default = t_d_far
+    self.t_d_mode = t_d_mode
     self.K_crust_default = K_crust_default
     self.G_crust_default = G_crust_default
     self.r_hydr_default = r_hydr_default
@@ -446,6 +460,21 @@ class GlobalSystemThreshold():
     self.always_max_eruption_rate = always_max_eruption_rate
     self.residual_overpressure = residual_overpressure
 
+    self.is_crust_bulk_viscous = is_crust_bulk_viscous
+
+    # Set default threshold mode and sanitize case
+    if threshold == "default":
+      threshold = "gradient"
+    elif threshold.casefold() == "gradient":
+      threshold = "gradient"
+    elif threshold.casefold() == "absdiff":
+      threshold = "absdiff"
+    else:
+      raise ValueError(f"Unknown threshold '{threshold}'. Use ('gradient'|'absdiff')")
+
+    self.threshold = threshold
+
+    
     self.M_crust_default = K_crust_default + 4.0*G_crust_default/3.0
     self.num_blocks = len(nodes)
     self.num_dof = self.num_blocks * self.block_size
@@ -673,13 +702,19 @@ class GlobalSystemThreshold():
     node.G_crust = getattr(node, "G_crust", self.G_crust_default)
     node.K_f     = getattr(node, "K_f", self.K_f_default)
     node.t_d     = getattr(node, "t_d", self.t_d_default)
+    node.t_d_far = getattr(node, "t_d_far", self.t_d_far_default)
+    node.t_d_mode = getattr(node, "t_d_mode", self.t_d_mode)
     node.t_b     = getattr(node, "t_b", self.t_b_default)
     # Read edge properties from node (assume upstream node properties apply in edge)
     node.r_hydr  = getattr(node, "r_hydr", self.r_hydr_default)
     node.mu0     = getattr(node, "mu0", self.mu_default)
     # Compute dependent quantities
     node.M_crust = node.K_crust + (4.0 / 3.0) * node.G_crust
-    
+
+    # Check whether to model dilatation as viscoelastic (True) or elastic (False) 
+    node.is_crust_bulk_viscous = getattr(node, "is_crust_bulk_viscous",
+                                         self.is_crust_bulk_viscous)
+
     # Unpack global grid node count (need consistency between all nodes)
     Nr = self.Nr
 
@@ -713,7 +748,8 @@ class GlobalSystemThreshold():
     L_u[:, Nr:2*Nr] = 2 * (node.G_crust/node.M_crust) * D \
                       + 6 * (node.G_crust/node.M_crust) * diag_inv_r
     # Construct mapping of γ_kk to term in static equilibrium equation
-    L_u[:, 2*Nr:3*Nr] = (node.K_crust/node.M_crust) * D
+    if node.is_crust_bulk_viscous:
+      L_u[:, 2*Nr:3*Nr] = (node.K_crust/node.M_crust) * D
 
     ''' Set traction boundary condition at r = R0
       \sigma_{rr} = -(p - p_0)
@@ -723,13 +759,21 @@ class GlobalSystemThreshold():
     # Replace first row with boundary traction (normalized by M_crust) Dirichlet
     # lift operator at r = R0 (linearized boundary treatment)
     L_u[0, :] = 0.0
-    L_u[0, 0] += -1.0 / dx
-    L_u[0, 1] += 1.0 / dx
+    _second_order_BC_diff = True
+    if _second_order_BC_diff:
+      # Use second order linear differentiation at boundary
+      # NOTE: one can also use a nonlinear differentiator made to work with r^-2 solutions
+      L_u[0, 0] += -1.5 / dx
+      L_u[0, 1] += 2.0 / dx
+      L_u[0, 2] += -0.5 / dx
+    else:
+      L_u[0, 0] += -1.0 / dx
+      L_u[0, 1] += 1.0 / dx
     L_u[0, 0] += (2*node.K_crust - 4*node.G_crust/3) / node.M_crust/ R0
     # Add r = R boundary dependence on γ_drr
     L_u[0, Nr] = -2 * node.G_crust / node.M_crust
     # Add r = R boundary dependence on γ_kk
-    L_u[0, 2*Nr] = -node.K_crust / node.M_crust
+    L_u[0, 2*Nr] = -node.K_crust / node.M_crust * 0
     # Add r = R boundary dependence on boundary pressure, linearly dependent on u, m
     L_u[0, 0] += - 3 * node.K_f / node.M_crust / R0
     L_u[0, 3*Nr] += node.K_f / m0 / node.M_crust
@@ -764,13 +808,37 @@ class GlobalSystemThreshold():
 
     # Assemble dependence of viscous strain evolution on displacement u (through elastic strain)
     G = scipy.sparse.lil_matrix((block_size, Nr))
-    G[0:Nr, 0:Nr] = -1.0 / node.t_d * op_E_drr(dx, Nr, r_mesh)
-    if node.t_b != np.inf:
+    if node.t_d == node.t_d_far:
+      G[0:Nr, 0:Nr] = -1.0 / node.t_d * op_E_drr(dx, Nr, r_mesh)
+    elif node.t_d_mode == "default":
+      # t_d gradient
+      G[0:Nr, 0:Nr] = \
+        -scipy.sparse.diags(1.0/np.geomspace(node.t_d, node.t_d_far, Nr)) @ op_E_drr(dx, Nr, r_mesh)
+      # G[np.arange(Nr), np.arange(Nr)] /= np.geomspace(node.t_d, node.t_d_far, Nr)
+    elif node.t_d_mode == "shell":
+      # Compute t_d(r)
+      t_d_r = np.full((Nr,), node.t_d)
+      t_d_r = np.where(node.r_mesh >= 2 * node.R0, node.t_d_far, t_d_r)
+      # Multiply out 1/t_d on to the strain operator
+      G[0:Nr, 0:Nr] = \
+        -scipy.sparse.diags(1.0/t_d_r) @ op_E_drr(dx, Nr, r_mesh)
+      
+    else:
+      raise ValueError("t_d_mode is set to an unknown string. Try setting t_d_mode=='default'. ")
+    # Bulk mode
+    if node.is_crust_bulk_viscous: # node.t_b != np.inf:
       G[Nr:2*Nr, 0:Nr] = -1.0 / node.t_b * op_E_kk(dx, Nr, r_mesh)
+
     # Compute matrix L
     node.L = scipy.sparse.lil_matrix((block_size, block_size))
-    node.L[np.arange(0,Nr), np.arange(0,Nr)] = (1 / node.t_d)
-    if node.t_b != np.inf:
+    if node.t_d == node.t_d_far:
+      node.L[np.arange(0,Nr), np.arange(0,Nr)] = (1 / node.t_d)
+    else:
+      # t_d gradient
+      node.L[np.arange(0,Nr), np.arange(0,Nr)] = \
+        1 / np.geomspace(node.t_d, node.t_d_far, Nr)
+
+    if node.is_crust_bulk_viscous: # node.t_b != np.inf:
       node.L[np.arange(Nr,2*Nr), np.arange(Nr,2*Nr)] = (1 / node.t_b)
     # Add dependence on u through Schur complement term
     node.L += G @ node.H
@@ -787,7 +855,7 @@ class GlobalSystemThreshold():
     # Save reference to system matrix
     # node.L_u = L_u
 
-  def get_connectivity(self, q, threshold="gradient"):
+  def get_connectivity(self, q):
     ''' 
     Positive connectivity matrix with units of admittance ( (m/s) / Pa )
     Nonzero values appear on either the upper diagonal (i -> j) or lower
@@ -796,7 +864,7 @@ class GlobalSystemThreshold():
     Legacy wrapper for self.mass_rates(q, return_format="Y").
     '''
 
-    return self.mass_rates(q, return_format="Y", threshold=threshold)
+    return self.mass_rates(q, return_format="Y")
   
     # Get system size information
     Nr, num_blocks, block_size = self.Nr, self.num_blocks, self.block_size
@@ -834,7 +902,7 @@ class GlobalSystemThreshold():
           threshold_factor = 1.0
 
         # Compute flow admittance ( (m/s) / Pa )
-        Y[i,j] = threshold_factor * self.r_hydr_defualt * self.r_hydr_defualt / 16.0 / self.mu0 / dist
+        Y[i,j] = threshold_factor * self.r_hydr_defualt * self.r_hydr_defualt / 8.0 / self.mu0 / dist
 
     return Y
 
@@ -853,7 +921,7 @@ class GlobalSystemThreshold():
       f[i*block_size:(i+1)*block_size,0] = node.f
     return L, f
 
-  def mass_rates(self, q, return_format=None, threshold="gradient"):
+  def mass_rates(self, q, return_format=None):
     ''' Compute the strictly lower triangular outgoing mass transfer matrix M,
     where M[i,j] represents the mass rate from j to i through edge (i,j),
     where the mass rate is nonnegative.
@@ -865,11 +933,6 @@ class GlobalSystemThreshold():
       * "Y": flow conductivity ((m/s) / Pa) matrix, with i -> j appearing in
         the upper triangular part, and j -> appearing in the lower part. Time-
         dependent.
-    
-    Parameter threshold sets the physical threshold:
-      * "gradient" (default): Threshold is set based on gradient |p_i - p_j| / dz
-      * "absdiff": Threshold is set based on absolute pressure difference |p_i - p_j|
-      * "fracture": Threshold is set based on local overpressure p_i - p_lithostatic
 
     Properties of output matrix if return_format is None:
       * Entries of M are >= 0
@@ -933,11 +996,12 @@ class GlobalSystemThreshold():
         # Resolve remote tensile stress in x-direction
         opening_stress = self.remote_sigma_xx \
           * np.abs(self.nodes[i].z - self.nodes[j].z) / self.dists[i,j]
-        # Effective critical pressure gradient for opening
-        dpdx_crit_eff = self.dpdx_crit - opening_stress
+        # Effective critical pressure gradient for opening, with component for
+        # remote tensile stress resolved on the edge
+        dpdx_crit_eff = self.dpdx_crit - opening_stress / self.dists[i,j]
 
         ''' Compute threshold factor between [0, 1] '''
-        if threshold == "gradient":
+        if self.threshold == "gradient":
           if dpdx_crit_eff <= 0:
             threshold_factor = 1.0
           else:
@@ -946,9 +1010,23 @@ class GlobalSystemThreshold():
                                         self.dpdx_threshold_scale))
             if threshold_factor > 1 or threshold_factor < 0:
               raise ValueError
+        elif self.threshold == "absdiff":
+          if dpdx_crit_eff <= 0:
+            threshold_factor = 1.0
+          else:
+            # Factor between (0, 1) that modulates flow between the two chambers
+            # NOTE: The parameter (self.)dpdx_crit is interpreted as the absolute
+            # pressure instead
+            p_crit = self.dpdx_crit - opening_stress
+            # Compute flow factor using pressure difference, with hydrostatic component
+            threshold_factor = float(smoother(np.abs(dpdx) * self.dists[i,j] - p_crit,
+                                        self.dpdx_threshold_scale))
+            if threshold_factor > 1 or threshold_factor < 0:
+              raise ValueError
         else:
-          raise ValueError(
-            f"Unknown threshold '{threshold}'. Use ('gradient'|'absdiff'|'fracture')")        
+          # Raise error is flag string saved internally is not compatible
+          raise NotImplementedError(
+            f"Unknown threshold '{self.threshold}'. Use ('gradient'|'absdiff')")        
 
         if threshold_factor > 1e-15:
           # Set upstream properties for flow
@@ -964,7 +1042,7 @@ class GlobalSystemThreshold():
             mu = self.nodes[j].mu0
           # Compute flow admittance ( (m/s) / Pa )
           #   sign is determined automatically by multiplication with state vector q
-          Y = threshold_factor * r_hydr * r_hydr / 16.0 / mu / self.dists[i,j]
+          Y = threshold_factor * r_hydr * r_hydr / 8.0 / mu / self.dists[i,j]
           # Multiply upstream density and bulk modulus to units (mass areal flux)
           mflux = Y * rho * K_f
           if return_format == "tups":
@@ -1249,7 +1327,7 @@ class GlobalSystemThreshold():
       # Compute actual overpressure for node 0
       deltap = self.nodes[0].p_init + feed_overpressure - p_node[0]
       # Compute injection rate by flow rule
-      injection_rate = self.nodes[0].rhoref * (deltap / (16.0 * mu)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
+      injection_rate = self.nodes[0].rhoref * (deltap / (8.0 * mu)) / 10 # * r_hydr * r_hydr * r_hydr # TODO: extract parameter
       f_inj[self.data_slice_global(0, "mass")] = injection_rate
       return f_inj
     return f
@@ -1262,7 +1340,7 @@ class GlobalSystemThreshold():
       # Compute pressure in excess of critical eruption overpressure
       deltap = (p_node[-1] - self.nodes[-1].p_init) - p_erupt
       if deltap > 0:
-        eruption_rate = self.nodes[-1].rhoref * (deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+        eruption_rate = self.nodes[-1].rhoref * (deltap / (8.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
         # Set eruption rate in mass conservation equation
         f_erupt[self.data_slice_global(-1, "mass")] = -eruption_rate
       return f_erupt
@@ -1314,7 +1392,7 @@ class GlobalSystemThreshold():
           # Compute eruption rate based on erupting node parameters and 
           # specified r_conduit length scale
           eruption_rate = self.nodes[node_idx].rhoref * (
-            deltap / (16.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
+            deltap / (8.0 * mu_erupt)) * r_conduit * r_conduit * r_conduit
           # Set eruption rate in mass conservation equation
           f_erupt[self.data_slice_global(node_idx, "mass")] = -eruption_rate
       return f_erupt
@@ -1720,7 +1798,8 @@ class GlobalSystemThreshold():
 
     return particle_history
 
-  def compute_effective_connectivity(self, t_vec, q_out, window_nodes_vec=None):
+  def compute_effective_connectivity(self, t_vec, q_out, window_nodes_vec=None,
+                                     num_inj=1):
     ''' Compute effective (scalar) connectivity at several averaging timescales
     Returns list of tuples [(n, dt_window, t_window_center, effective_conductivity)]
     If windows_nodes_vec is not provided, selects some windows of size ~4^n.
@@ -1765,7 +1844,11 @@ class GlobalSystemThreshold():
           continue
         # Construct s-t test vector
         chi = np.zeros(Y_avg.shape[0],)
-        chi[[0, -1]] = [1.0, -1.0]
+        if num_inj == 1:
+          chi[[0, -1]] = [1.0, -1.0]
+        else:
+          chi[np.arange(0, num_inj)] = 1.0/num_inj
+          chi[-1] = -1.0
         # Compute effective conductivity using conjugate gradient for PSD matrix
         v, exit_code = scipy.sparse.linalg.cg(nx.laplacian_matrix(G), chi)
         if exit_code != 0:
@@ -1778,14 +1861,13 @@ class GlobalSystemThreshold():
 
     return all_effective_conductivities
 
-  def compute_time_averaged_connectivity_matrix(self, t_vec, q, averaged=True,
-                                                threshold="gradient"):
+  def compute_time_averaged_connectivity_matrix(self, t_vec, q, averaged=True):
     ''' Computes time-averaged connectivity matrix Y.
     Alternatively, if `averaged` is False, returns the list of matrices Y at
     each time in vector t.
      '''
     
-    Y = np.stack([self.mass_rates(q[i,:], return_format="Y", threshold=threshold)
+    Y = np.stack([self.mass_rates(q[i,:], return_format="Y")
                    for i, t in enumerate(t_vec)], axis=0)
 
     if averaged:
